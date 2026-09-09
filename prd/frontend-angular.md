@@ -1,637 +1,754 @@
-# PRD — Sales Point (Frontend Angular)
+# Product Requirements Document (PRD)
+## Sales Point — Angular Frontend
 
-> Product: **Sales Point** — aplikasi mobile-first untuk agen lapangan akuisisi Mini ATM (VisioNet).
-> Platform: Angular 17+ (standalone components), PWA, target browser mobile (Chrome/Safari).
-> Sumber: mockup HTML self-contained, 13 layar, bahasa Indonesia.
-
----
-
-## 1. Tujuan & Lingkup Frontend
-
-Membangun seluruh lapisan **frontend** (UI, state, service, routing) dari aplikasi Sales Point dengan Angular. Backend API diasumsikan tersedia (REST + JWT); dokumen ini hanya mencakup konsumsi dan presentasi.
-
-### 1.1 Persona
-
-| Kode | Persona | Konteks |
-|------|---------|---------|
-| AGENT | Sales Point Agent (lapangan) | Login, clock in/out GPS, daftar prospek toko dengan foto plang + selfie PIC, lihat history & notifikasi. |
-| SUPV | Supervisor (out-of-scope UI) | Hanya muncul via data notifikasi/referral; tidak punya layar sendiri di rilis awal. |
-
-### 1.2 Non-Goals (frontend)
-
-- Tidak membangun dashboard admin / supervisor.
-- Tidak membangun manajemen user/role (hanya read-only di profil).
-- Tidak membangun report builder; chart pada profil bersifat read-only dari API.
+> **VisioNet Mini ATM · Sales Point** — Field-agent acquisition app for Mini ATM placement at retail stores.  
+> **Platform:** Mobile-first PWA (Angular standalone components)  
+> **Target devices:** Android / iOS mobile browsers, installable PWA  
+> **Scope:** Frontend only (Angular 17+ standalone, signals, zoneless-ready)
 
 ---
 
-## 2. Stack & Konvensi Teknis
+## 1. Overview & Scope
 
-| Area | Pilihan |
-|------|---------|
-| Framework | Angular 17 (standalone components, tanpa NgModules) |
-| Bahasa | TypeScript strict mode |
-| State | NgRx (store + effects + entity) |
-| Forms | Reactive Forms |
-| Styling | SCSS + CSS variables (port token dari mockup) |
-| Icons | Inline SVG sprite (dari mockup) → bungkus dalam `IconComponent` |
-| Charts | SVG custom (dari mockup) → komponen `MonthChartComponent` |
-| HTTP | `HttpClient` + interceptor |
-| PWA | `@angular/service-worker` (offline cache + splash) |
-| Animasi | `@angular/animations` (screen-in, modal pop, toast) |
-| Lint | ESLint + Prettier; aturan `@angular-eslint` |
-| Test | Jest + `@testing-library/angular`; e2e Playwright |
+### 1.1 Purpose
+A mobile-first Angular application enabling field sales agents to:
+- Authenticate against a backend agent portal.
+- Clock in / clock out with GPS + selfie.
+- Capture new store prospects (Prospek Toko) with geo-stamped documentation photos.
+- Browse prospect history with search.
+- View notifications and a personal performance dashboard (monthly chart).
 
-### 2.1 Design Tokens (dari `:root` mockup)
+### 1.2 Out of Scope (Backend responsibilities)
+- Actual auth token issuance / session validation.
+- Persistence of prospects, attendance, notifications.
+- Geocoding / reverse-geocoding services.
+- File storage for uploaded photos.
 
-Semua CSS variables pada mockup (`--navy-1`, `--accent`, `--orange`, `--good`, `--warn`, `--crit`, `--r-lg`, `--shadow`, dsb.) dipindahkan ke `src/styles/_tokens.scss` dan dipetakan ke Angular Material-like theme tanpa mengubah nama kelas visual.
-
-```scss
-// _tokens.scss (excerpt)
-:root{
-  --accent:#2a78d6;
-  --accent-strong:#184f95;
-  --orange:#f5821f;
-  --good:#0ca30c; --warn:#fab219; --crit:#d03b3b;
-  --hdr-1:#241566; --hdr-2:#2a1a72; --hdr-3:#1f1a6e;
-  --surface:#ffffff; --surface-2:#f5f9fe;
-  --gridline:#e1e8f2; --border:rgba(20,40,70,.09);
-  --r-lg:18px; --r-md:12px; --r-sm:8px;
-  --shadow:0 1px 2px rgba(20,40,70,.04),0 8px 24px -12px rgba(20,60,120,.14);
-  --font:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
-}
-```
-
-### 2.2 Konvensi Kode
-
-- Prefix selector: `sp-` (sales point). Contoh: `<sp-app-bar>`, `<sp-nav-btn>`.
-- Naming file: `kebab-case.ts`, class `PascalCaseComponent`.
-- Setiap komponen standalone; `imports:` eksplisit.
-- OnPush change detection untuk semua komponen presentasi.
-- Tidak ada logika DOM manual (cek mockup JS vanilla); semua dipindahkan ke binding Angular.
+The frontend will interact with a REST/JSON API (contract defined in §6 Services).
 
 ---
 
-## 3. Arsitektur Modul & Folder
+## 2. Technology Stack
+
+| Layer | Choice | Rationale |
+|---|---|---|
+| Framework | Angular 17+ (standalone components, signals) | Modern, tree-shakeable, signal-based reactivity |
+| Routing | `@angular/router` with lazy-loaded routes | Code-split per feature |
+| State | **NgRx SignalStore** (component-store pattern) | Lightweight, signal-native; avoids NgRx boilerplate |
+| Forms | Reactive Forms + custom validators | Predictable, testable |
+| HTTP | `HttpClient` with interceptors | Token refresh, error normalisation |
+| Styling | SCSS with CSS custom properties (design tokens) | Exact port of mockup token system |
+| Charts | Custom SVG component (no chart lib) | Matches mockup; tiny footprint |
+| Camera | `getUserMedia` + `<canvas>` capture | Native browser API |
+| Icons | Inline SVG sprite component | Matches mockup stroke style |
+| PWA | `@angular/service-worker` | Offline shell, manifest |
+| Testing | Jest + Playwright | Unit + E2E |
+
+---
+
+## 3. Architecture & Module Structure
+
+### 3.1 High-Level Architecture
 
 ```
 src/
-├─ app/
-│  ├─ core/                       # singleton
-│  │  ├─ services/                 # AuthService, AttendanceService, ...
-│  │  ├─ guards/                   # AuthGuard, ClockInGuard, PendingPhotoGuard
-│  │  ├─ interceptors/             # AuthInterceptor, ErrorInterceptor, LoadingInterceptor
-│  │  ├─ models/                   # interfaces (User, Attendance, Prospek, ...)
-│  │  └─ core.config.ts
-│  ├─ state/                       # NgRx
-│  │  ├─ auth/  attendance/  prospek/  notif/  profile/  ui/
-│  │  └─ index.ts                 # meta-reducers, store config
-│  ├─ shared/                     # dumb components, pipes, directives
-│  │  ├─ components/  pipes/  directives/
-│  │  └─ shared.config.ts         # export array SHARED_COMPONENTS
-│  ├─ features/
-│  │  ├─ auth/                    # splash, login, loading
-│  │  ├─ attendance/              # gate, detail
-│  │  ├─ home/
-│  │  ├─ prospek/                 # check-in, history, detail
-│  │  ├─ camera/
-│  │  ├─ photo-viewer/
-│  │  ├─ notifications/
-│  │  └─ profile/
-│  ├─ layout/                     # ShellComponent (device frame + bottom nav)
-│  │  └─ shell.component.ts
-│  ├─ app.routes.ts
-│  └─ app.component.ts
-├─ assets/  (logo webp, brand)
-└─ styles/ (_tokens.scss, _reset.scss, _animations.scss, styles.scss)
+├── app/
+│   ├── app.config.ts              // ApplicationConfig (providers, router, SW)
+│   ├── app.routes.ts              // Top-level route config
+│   ├── core/                      // Singleton services, guards, interceptors
+│   │   ├── services/
+│   │   ├── guards/
+│   │   ├── interceptors/
+│   │   └── models/                // TypeScript interfaces & DTOs
+│   ├── shared/                    // Reusable UI components, directives, pipes
+│   │   ├── components/            // Button, Card, Badge, Toast, Modal, etc.
+│   │   ├── directives/
+│   │   └── pipes/
+│   ├── stores/                    // SignalStore definitions (global + feature)
+│   │   ├── auth.store.ts
+│   │   ├── attendance.store.ts
+│   │   ├── prospect.store.ts
+│   │   ├── notification.store.ts
+│   │   └── ui.store.ts            // Toast, modal, active-tab, screen state
+│   └── features/                  // Lazy-loaded feature areas
+│       ├── auth/                  // Splash + Login + Loading
+│       ├── gate/                  // Clock-in gate
+│       ├── home/                  // Dashboard
+│       ├── attendance/            // Absen detail
+│       ├── prospect/              // Check-in form + Detail + Photo viewer
+│       │   ├── check-in/
+│       │   ├── detail/
+│       │   ├── history/
+│       │   └── camera/
+│       ├── notification/
+│       └── profile/
+├── assets/
+│   └── scss/
+│       ├── _tokens.scss           // CSS custom properties
+│       ├── _mixins.scss
+│       └── _base.scss
+└── styles.scss
 ```
 
-### 3.1 Module Dependency Graph
+### 3.2 Feature Modules (Lazy-Loaded Routes)
 
-```
-core ───► state ───► features ───► layout ───► app
-                       │
-                       └──► shared
-```
+Each feature is a standalone-component route group with its own route file:
 
-Lazy-load semua `features/*` kecuali `auth` (preload critical).
+| Feature | Route prefix | Components |
+|---|---|---|
+| Auth | `/auth` | Splash, Login, Loading |
+| Gate | `/gate` | ClockInGate |
+| Home | `/home` | Home |
+| Attendance | `/attendance` | AbsenDetail |
+| Prospect / Check-in | `/prospect/new` | CheckInForm |
+| Prospect / History | `/prospect/history` | HistoryList |
+| Prospect / Detail | `/prospect/:id` | ProspectDetail |
+| Prospect / Camera | `/prospect/camera` | CameraCapture |
+| Prospect / Viewer | `/prospect/viewer` | PhotoViewer |
+| Notification | `/notifications` | NotificationList |
+| Profile | `/profile` | Profile |
 
 ---
 
-## 4. Routing
+## 4. Routing Configuration
 
 ### 4.1 Route Tree
 
 ```ts
 // app.routes.ts
 export const APP_ROUTES: Routes = [
-  { path: '',           component: SplashComponent,          title: 'Sales Point' },
-  { path: 'auth/login', loadComponent: () => import('./features/auth/login/login.component').then(m => m.LoginComponent) },
-  { path: 'loading',    loadComponent: () => import('./features/auth/loading/loading.component').then(m => m.LoadingComponent) },
-
-  // pre-authenticated gate
-  { path: 'clock-in',
-    canActivate: [AuthGuard],
-    loadComponent: () => import('./features/attendance/gate/clock-in-gate.component').then(m => m.ClockInGateComponent) },
-
-  // authenticated shell with bottom nav
   {
-    path: 'app',
-    canActivate: [AuthGuard, ClockInGuard],
-    component: ShellComponent,
-    children: [
-      { path: 'home',          loadComponent: () => import('./features/home/home.component').then(m => m.HomeComponent) },
-      { path: 'attendance',     loadComponent: () => import('./features/attendance/detail/attendance-detail.component').then(m => m.AttendanceDetailComponent) },
-      { path: 'prospek/new',    loadComponent: () => import('./features/prospek/checkin/prospek-checkin.component').then(m => m.ProspekCheckinComponent) },
-      { path: 'prospek/history',loadComponent: () => import('./features/prospek/history/prospek-history.component').then(m => m.ProspekHistoryComponent) },
-      { path: 'prospek/:id',    loadComponent: () => import('./features/prospek/detail/prospek-detail.component').then(m => m.ProspekDetailComponent) },
-      { path: 'notifications',  loadComponent: () => import('./features/notifications/notifications.component').then(m => m.NotificationsComponent) },
-      { path: 'profile',        loadComponent: () => import('./features/profile/profile.component').then(m => m.ProfileComponent) },
-      { path: '', redirectTo: 'home', pathMatch: 'full' },
-    ],
+    path: 'auth',
+    loadComponent: () => import('./features/auth/auth.routes').then(m => m.AUTH_ROUTES),
   },
-
-  // overlays (outside shell — full-screen)
-  { path: 'camera/:shot',     canActivate: [AuthGuard], loadComponent: () => import('./features/camera/camera.component').then(m => m.CameraComponent) },
-  { path: 'photo/:id/:kind',  canActivate: [AuthGuard], loadComponent: () => import('./features/photo-viewer/photo-viewer.component').then(m => m.PhotoViewerComponent) },
-
-  { path: '**', redirectTo: '' },
+  {
+    path: 'gate',
+    canActivate: [authGuard, clockInGuard],
+    loadComponent: () => import('./features/gate/gate.component').then(m => m.ClockInGateComponent),
+  },
+  {
+    path: 'home',
+    canActivate: [authGuard],
+    loadComponent: () => import('./features/home/home.component').then(m => m.HomeComponent),
+  },
+  {
+    path: 'attendance',
+    canActivate: [authGuard],
+    loadComponent: () => import('./features/attendance/attendance.component').then(m => m.AttendanceComponent),
+  },
+  {
+    path: 'prospect',
+    canActivate: [authGuard, attendanceGuard],
+    loadChildren: () => import('./features/prospect/prospect.routes').then(m => m.PROSPECT_ROUTES),
+  },
+  {
+    path: 'notifications',
+    canActivate: [authGuard],
+    loadComponent: () => import('./features/notification/notification.component').then(m => m.NotificationComponent),
+  },
+  {
+    path: 'profile',
+    canActivate: [authGuard],
+    loadComponent: () => import('./features/profile/profile.component').then(m => m.ProfileComponent),
+  },
+  { path: '', redirectTo: 'auth/splash', pathMatch: 'full' },
+  { path: '**', redirectTo: 'auth/splash' },
 ];
 ```
 
-### 4.2 Route Guards
-
-| Guard | Tujuan |
-|-------|--------|
-| `AuthGuard` | Cek `auth.user$`; redirect ke `/auth/login` bila null. |
-| `ClockInGuard` | Cek `attendance.today$.clockIn`; bila belum → redirect ke `/clock-in` (kecuali route `/app/attendance` agar bisa lihat history). |
-| `PendingPhotoGuard` | Bila `prospek.draft.photos.{plang\|selfie}` null saat route ke prospek detail dari check-in → blok & toast. |
-
-### 4.3 Strategi Preload
-
-`PreloadAllModules` kecuali `camera/*` dan `photo/*` (berat, jarang). Gunakan custom `SelectivePreloadStrategy`.
-
----
-
-## 5. State Management (NgRx)
-
-### 5.1 Slices
-
-| Slice | State utama | Actions |
-|-------|-------------|---------|
-| `auth` | `user`, `token`, `loading`, `error` | `Login`, `LoginSuccess`, `LoginFail`, `Logout`, `LogoutConfirm`, `SessionExpire` |
-| `attendance` | `today`, `history`, `loading`, `error` | `ClockIn`, `ClockInSuccess`, `ClockOut`, `ClockOutSuccess`, `LoadHistory`, `LoadHistoryOlder` |
-| `prospek` | `today: Prospek[]`, `history: DayGroup[]`, `draft: { photos, form }`, `selected: Prospek`, `loading` | `SaveProspek`, `SaveProspekSuccess`, `LoadHistory`, `LoadHistoryOlder`, `SearchProspek`, `SelectProspek`, `ResetDraft`, `SetDraftPhoto` |
-| `notif` | `groups: NotifGroup[]`, `unread: number` | `LoadNotif`, `MarkRead`, `MarkAllRead`, `UnreadUpdated` |
-| `profile` | `profile`, `chartData`, `loading` | `LoadProfile`, `LoadChart`, `CopyReferral` |
-| `ui` | `activeScreen`, `toast`, `modal`, `camFacing`, `camTorch` | `Navigate`, `ShowToast`, `OpenModal`, `CloseModal`, `SetCamFacing`, `SetTorch` |
-
-### 5.2 Effects (high-level)
-
-- `AuthEffects.login$` → POST `/auth/login`; on success → `LoginSuccess` + `Navigate('/loading')`.
-- `AuthEffects.loadingSequence$` → simulasikan step load (token: 18/42/63/84/100%) → `Navigate('/clock-in' | '/app/home')`.
-- `AttendanceEffects.clockIn$` → POST `/attendance/clock-in` (body: `{lat,lng,accuracy,selfieBase64}`).
-- `AttendanceEffects.clockOut$` → POST `/attendance/clock-out`.
-- `ProspekEffects.save$` → POST `/prospek` (multipart: photos + JSON form).
-- `ProspekEffects.search$` → debounce 250ms, filter lokal (data sudah di-cache).
-- `NotifEffects.markAllRead$` → POST `/notifications/read-all`.
-- `ProfileEffects.copyReferral$` → side-effect clipboard via `ClipboardService`.
-
-### 5.3 Selectors utama
+### 4.2 Prospect Sub-routes
 
 ```ts
-selectUser              // auth.user
-selectIsAuthenticated   // !!auth.token
-selectTodayAttendance   // attendance.today
-selectHasClockedIn      // !!attendance.today?.clockIn
-selectTodayProspekCount // prospek.today.length
-selectProspekDraft      // prospek.draft
-selectUnreadNotif       // notif.unread
-selectToast             // ui.toast
+// prospect.routes.ts
+export const PROSPECT_ROUTES: Routes = [
+  { path: 'new',     component: CheckInFormComponent },
+  { path: 'history', component: HistoryListComponent },
+  { path: ':id',     component: ProspectDetailComponent },
+  { path: 'camera',  component: CameraCaptureComponent },
+  { path: 'viewer',  component: PhotoViewerComponent },
+  { path: '',        redirectTo: 'history', pathMatch: 'full' },
+];
 ```
 
-### 5.4 Entity adapter
+### 4.3 Route Guards
 
-`prospek` pakai `@ngrx/entity` untuk `Prospek` (id = UUID). `notif` pakai struktur group biasa (urutan tetap, mark-read per item).
+| Guard | Purpose |
+|---|---|
+| `authGuard` | Redirects unauthenticated users to `/auth/login`. Checks `authStore.isAuthenticated()`. |
+| `clockInGuard` | Allows `/gate` only when not yet clocked in; redirects to `/home` if already clocked in. |
+| `attendanceGuard` | Blocks `/prospect/new` if not clocked in; redirects to `/gate`. |
+
+### 4.4 Navigation Strategy
+
+- **No `routerLink` for in-app "screens" that share the device-shell.** The mockup uses a custom screen-transition system (absolute-positioned screens with fade/slide). To preserve UX fidelity, the app uses **`provideRouter` with `InMemoryScrolling`** and a **custom `ScreenTransitionService`** that wraps `Router.navigate()` to add the `screen-in` animation class.
+- Bottom-nav tabs (`Home`, `Notifikasi`, `Profil`) use standard `routerLink` with `routerLinkActive`.
+- Back buttons call `Location.back()` or navigate to a defined parent route.
+
+### 4.5 Route Data & Chrome Toggling
+
+Each route sets `data: { chrome: 'navy' | 'black' }`:
+- `black` → camera and photo-viewer screens (status bar background black).
+- `navy` → all other screens.
+
+A `ChromeDirective` on the root `<app-root>` host reads `ActivatedRoute` data and toggles a `data-chrome` attribute consumed by SCSS.
 
 ---
 
-## 6. Model Data (interfaces)
+## 5. State Management Strategy
+
+### 5.1 Approach: NgRx SignalStore (component + global)
+
+Use `@ngrx/signals` `signalStore` for global cross-feature state, and `withComponentStore`-equivalent local stores for screen-scoped state (camera, check-in form).
+
+### 5.2 Global Stores
+
+#### 5.2.1 `AuthStore`
 
 ```ts
-// core/models/user.model.ts
-export interface User {
+export const AuthStore = signalStore(
+  { providedIn: 'root' },
+  withState<AuthState>({
+    status: 'idle',           // 'idle' | 'authenticating' | 'authenticated' | 'error'
+    user: null,                // AgentProfile | null
+    token: null,               // string | null
+    rememberMe: true,
+    error: null,               // string | null
+  }),
+  withComputed(({ user }) => ({
+    initials: computed(() => user()?.fullName
+      ? user()!.fullName.split(' ').slice(0, 2).map(w => w[0]).join('').toUpperCase()
+      : ''),
+    referralCode: computed(() => user()?.referralCode ?? null),
+  })),
+  withMethods((store, authApi = inject(AuthApiService)) => ({
+    async login(credentials: LoginCredentials) { /* ... */ },
+    logout() { /* ... */ },
+  })),
+  withHooks({
+    onInit(store) { /* hydrate from localStorage if rememberMe */ },
+  }),
+);
+```
+
+#### 5.2.2 `AttendanceStore`
+
+| Signal | Type | Description |
+|---|---|---|
+| `today` | `AttendanceRecord \| null` | Today's clock-in/out record |
+| `history` | `AttendanceRecord[]` | Past 5 days |
+| `olderHistory` | `AttendanceRecord[]` | Loaded on demand |
+| `status` | `'idle' \| 'loading' \| 'loaded' \| 'error'` | |
+| `hasOlder` | `boolean` | More history available? |
+
+Methods: `clockIn()`, `clockOut()`, `loadHistory()`, `loadOlder()`.
+
+Computed: `isClockedIn`, `isClockedOut`, `durationLabel`.
+
+#### 5.2.3 `ProspectStore`
+
+| Signal | Type |
+|---|---|
+| `today` | `Prospect[]` |
+| `groups` | `ProspectDayGroup[]` (today + loaded older days) |
+| `olderRemaining` | `number` |
+| `detail` | `Prospect \| null` |
+| `searchQuery` | `string` |
+| `photos` | `{ plang: string \| null; selfie: string \| null }` (active check-in) |
+| `status` | `'idle' \| 'loading' \| 'saving' \| 'saved' \| 'error'` |
+
+Methods: `save(prospect)`, `loadOlder()`, `setSearch(q)`, `selectDetail(id)`, `resetPhotos()`.
+
+#### 5.2.4 `NotificationStore`
+
+| Signal | Type |
+|---|---|
+| `groups` | `NotificationDayGroup[]` |
+| `unreadCount` | `number` |
+
+Methods: `markRead(id)`, `markAllRead()`.
+
+#### 5.2.5 `UiStore`
+
+Transient UI state shared across components:
+
+| Signal | Type | Description |
+|---|---|---|
+| `toast` | `{ message: string; visible: boolean } \| null` | Current toast |
+| `activeModal` | `'success' \| 'clock-in' \| 'logout' \| null` | Currently open modal |
+| `deviceChrome` | `'navy' \| 'black'` | Status bar / device-shell colour |
+
+Methods: `showToast(msg, ms?)`, `openModal(id)`, `closeModal()`.
+
+### 5.3 Local (Component-Scoped) Stores
+
+- **`CameraStore`** (provided in `CameraCaptureComponent`): `stream`, `facingMode`, `torch`, `error`, `kind`.
+- **`CheckInFormStore`** (provided in `CheckInFormComponent`): wraps `FormGroup`, photo slots, validation flags.
+
+---
+
+## 6. Core Models & Interfaces
+
+```ts
+// core/models/agent.model.ts
+export interface AgentProfile {
   id: string;
   username: string;
   fullName: string;
   email: string;
-  referralCode: string;     // 'SP-RZK2041'
-  role: 'AGENT';
-  active: boolean;
+  role: 'agent';
+  referralCode: string;        // e.g. "SP-RZK2041"
+  area: string;                 // e.g. "Jakarta Selatan"
+  branch: string;               // e.g. "Kantor Cabang Jakarta Selatan"
+  status: 'active' | 'suspended';
+  avatarUrl?: string;
 }
 
 // core/models/attendance.model.ts
-export interface AttendanceToday {
-  date: string;             // ISO
-  shift: { name: string; start: string; end: string };  // '08:00','17:00'
-  clockIn?: string;         // 'HH:mm'
-  clockOut?: string;
-  location: { lat: number; lng: number; label: string; accuracyM: number };
-  method: 'GPS+SELFIE';
-}
-export interface AttendanceHistoryItem {
-  dd: string; mm: string; day: string;
-  in: string; out: string; dur: string;
-  st: string; cls: 'good'|'warn'|'info'|'crit';
+export interface AttendanceRecord {
+  id: string;
+  date: string;                 // ISO date (YYYY-MM-DD)
+  clockIn?: string;             // "HH:mm"
+  clockOut?: string;            // "HH:mm"
+  location: GeoLocation;
+  method: 'gps_selfie' | 'gps';
+  shift: { name: string; start: string; end: string };
+  status: 'on_time' | 'late' | 'permission';
 }
 
-// core/models/prospek.model.ts
-export interface Prospek {
+export interface GeoLocation {
+  lat: number;
+  lng: number;
+  address: string;
+  accuracyMeters: number;
+  branch?: string;
+}
+
+// core/models/prospect.model.ts
+export type ProspectStatus = 'verified' | 'pending' | 'rejected';
+
+export interface Prospect {
   id: string;
-  name: string;
+  storeName: string;
   address: string;
   picName: string;
   picPhone: string;
-  visitTime: string;        // 'HH:mm'
-  visitDate: string;        // '4 September 2026'
+  visitTime: string;            // "HH:mm"
+  visitDate: string;            // "4 September 2026"
+  status?: ProspectStatus;
   note?: string;
-  photoPlang?: string;       // dataURL or asset URL
+  photoPlang?: string;          // data URL or CDN URL
   photoSelfie?: string;
-  status?: 'verified'|'pending'|'rejected';
-  coords?: { lat: number; lng: number };
+  location?: { lat: number; lng: number };
+  createdAt: string;            // ISO datetime
 }
 
-// core/models/notif.model.ts
-export interface NotifItem {
+export interface ProspectDayGroup {
+  dateLabel: string;            // "Hari Ini — Jumat, 4 September 2026"
+  items: Prospect[];
+}
+
+// core/models/notification.model.ts
+export type NotificationKind = 'success' | 'reminder' | 'info' | 'warning';
+
+export interface AppNotification {
   id: string;
-  icon: 'blue'|'green'|'orange'|'red';
+  kind: NotificationKind;
   title: string;
   body: string;
-  time: string;
-  unread: boolean;
-  svgKey: string;           // key into ICON_REGISTRY
+  timestamp: string;            // ISO
+  read: boolean;
 }
-export interface NotifGroup { day: string; items: NotifItem[]; }
+
+export interface NotificationDayGroup {
+  dateLabel: string;
+  items: AppNotification[];
+}
 
 // core/models/chart.model.ts
-export interface ChartPoint { m: string; v: number; current?: boolean; }
+export interface MonthlyDataPoint {
+  month: string;                // "Jan"
+  value: number;
+  isCurrent?: boolean;
+}
 ```
 
 ---
 
-## 7. Services (core)
+## 7. Services Layer
 
-| Service | Tanggung jawab | Method utama |
-|---------|----------------|--------------|
-| `AuthService` | login/logout, simpan token (localStorage), expose `user$` | `login(u,p)`, `logout()`, `restoreSession()` |
-| `AttendanceService` | clock in/out, history | `clockIn(payload)`, `clockOut()`, `getToday()`, `getHistory()`, `getOlder()` |
-| `ProspekService` | CRUD prospek | `save(form,photos)`, `listToday()`, `listHistory(cursor)`, `search(q)`, `getById(id)` |
-| `NotificationService` | list & mark-read | `list()`, `markRead(id)`, `markAllRead()` |
-| `ProfileService` | profile + chart | `getProfile()`, `getMonthlyChart()` |
-| `GeolocationService` | wrap `navigator.geolocation` → RxJS | `watchAccuracy$()`, `getCurrent()` |
-| `CameraService` | wrap `getUserMedia`, capture, torch, flip | `open(kind)`, `capture()`, `toggleTorch()`, `flip()`, `stop()` |
-| `ClipboardService` | copy text dengan fallback `execCommand` | `copy(text)` |
-| `DownloadService` | unduh foto (dataURL → blob) | `save(filename, blob)` |
-| `ToastService` | antrian toast (NgRx `ui.toast`) | `show(msg)`, `dismiss()` |
-| `ModalService` | open/close overlay (NgRx `ui.modal`) | `open(id)`, `close(id)` |
-| `LoadingService` | simulasikan/observ loading step | `run(steps: Step[])` |
-| `ErrorHandlerService` | global error → toast + log | — |
+### 7.1 API Services (HTTP)
 
-### 7.1 HTTP Interceptors
+All API services inject `HttpClient` and return observables converted to signals via `toSignal` where appropriate.
 
-1. **AuthInterceptor** — sisipkan `Authorization: Bearer <token>` ke semua request ke `/api/*`.
-2. **ErrorInterceptor** — tangani 401 → dispatch `SessionExpire` + navigate `/auth/login`; ≥500 → toast generik.
-3. **LoadingInterceptor** (opsional) — increment/decrement global loading counter untuk spinner.
+#### `AuthApiService`
 
-### 7.2 Environment
+| Method | Endpoint | Body / Params | Returns |
+|---|---|---|---|
+| `login(creds)` | `POST /api/auth/login` | `{ username, password, rememberMe }` | `{ token, user: AgentProfile }` |
+| `logout()` | `POST /api/auth/logout` | — | `void` |
+| `refreshProfile()` | `GET /api/auth/me` | — | `AgentProfile` |
+
+#### `AttendanceApiService`
+
+| Method | Endpoint | Returns |
+|---|---|---|
+| `getToday()` | `GET /api/attendance/today` | `AttendanceRecord \| null` |
+| `clockIn(payload)` | `POST /api/attendance/clock-in` | `AttendanceRecord` |
+| `clockOut()` | `POST /api/attendance/clock-out` | `AttendanceRecord` |
+| `getHistory(monthOffset)` | `GET /api/attendance/history?offset={n}` | `AttendanceRecord[]` |
+
+#### `ProspectApiService`
+
+| Method | Endpoint | Returns |
+|---|---|---|
+| `getToday()` | `GET /api/prospects/today` | `Prospect[]` |
+| `getOlder(cursor)` | `GET /api/prospects?cursor={id}&limit=20` | `{ items: Prospect[]; nextCursor: string \| null }` |
+| `getById(id)` | `GET /api/prospects/{id}` | `Prospect` |
+| `create(payload)` | `POST /api/prospects` (multipart) | `Prospect` |
+| `search(q)` | `GET /api/prospects/search?q={q}` | `Prospect[]` |
+
+#### `NotificationApiService`
+
+| Method | Endpoint | Returns |
+|---|---|---|
+| `getAll()` | `GET /api/notifications` | `NotificationDayGroup[]` |
+| `markRead(id)` | `PATCH /api/notifications/{id}/read` | `void` |
+| `markAllRead()` | `POST /api/notifications/read-all` | `void` |
+
+#### `ChartApiService`
+
+| Method | Endpoint | Returns |
+|---|---|---|
+| `getMonthly()` | `GET /api/stats/monthly` | `MonthlyDataPoint[]` |
+
+### 7.2 Infrastructure Services
+
+#### `HttpInterceptor` (`authInterceptor`)
 
 ```ts
-export const environment = {
-  production: false,
-  apiBase: '/api',
-  demo: true,                       // kredensial demo rizky.pratama/salespoint
-  mapTile: 'https://.../...',       // tidak dipakai langsung; lokasi via label
-  attendance: { shiftStart: '08:00', shiftEnd: '17:00', cutoffMin: 17*60 },
+export const authInterceptor: HttpInterceptorFn = (req, next) => {
+  const auth = inject(AuthStore);
+  const token = auth.token();
+  const cloned = token
+    ? req.clone({ setHeaders: { Authorization: `Bearer ${token}` } })
+    : req;
+  return next(cloned).pipe(
+    catchError((err: HttpErrorResponse) => {
+      if (err.status === 401) {
+        auth.logout();
+        inject(Router).navigate(['/auth/login']);
+      }
+      return throwError(() => err);
+    }),
+  );
 };
 ```
 
----
+#### `LoadingSequenceService`
 
-## 8. Shared Components
+Replicates the splash → login → loading → gate sequence. Steps:
+1. `authenticating` (18%) — verify credentials
+2. `loading-profile` (42%) — load agent profile + work area
+3. `syncing-attendance` (63%) — pull today's attendance
+4. `pulling-prospects` (84%) — pull today's prospects
+5. `ready` (100%) — navigate to `/gate` or `/home`
 
-Semua standalone, OnPush, dengan `inputs()` / `outputs()` Angular 17.
+Each step emits `{ progress: number; status: string }` via a signal; UI binds to it. Randomised 430–690 ms delay per step (matching mockup feel).
 
-### 8.1 Daftar Komponen
-
-| Selector | Input / Output | Deskripsi |
-|----------|----------------|-----------|
-| `<sp-app-bar>` | `title`, `subtitle?`, `showBack?` | Header gradient + back button + vec bg. |
-| `<sp-icon-btn>` | `icon: string`, `ariaLabel?`, `variant?` | Tombol icon bulat (lihat `IconComponent`). |
-| `<sp-nav-btn>` | `icon`, `label`, `active?`, `badge?` | Item bottom nav. |
-| `<sp-bottom-nav>` | `active: 'home'\|'notif'\|'profile'`, `unread$` | Container nav 3 kolom. |
-| `<sp-card>` | `class?`, projected content | Card surface with shadow. |
-| `<sp-badge>` | `variant: 'good'\|'warn'\|'crit'\|'info'`, `pip?` | Pill badge. |
-| `<sp-btn>` | `variant: 'primary'\|'ghost'\|'danger'\|'red'\|'green'`, `icon?`, `loading?`, `disabled?` | Tombol utama. |
-| `<sp-input>` | Reactive `ControlValueAccessor`, `icon?`, `type`, `placeholder`, `error?` | Wrap input + icon + hint-error. |
-| `<sp-textarea>` | CVA, `rows`, `placeholder`, `error?` | Textarea variant. |
-| `<sp-field>` | `label`, `required?`, `invalid?`, `hint?` | Wrapper label + control + hint-error. |
-| `<sp-search-bar>` | CVA, `placeholder` | Search input with clear button. |
-| `<sp-photo-slot>` | `kind: 'plang'\|'selfie'`, `filled?`, `photoUrl?`, `time?` | Slot foto 3:4 dengan tombol retake. |
-| `<sp-stat-cell>` | `value`, `label`, `color?` | Stat cell dalam grid 3-kolom. |
-| `<sp-meter>` | `value: number`, `max: number` | Progress meter horizontal. |
-| `<sp-avatar>` | `initials`, `size?: 'sm'\|'lg'` | Avatar gradient orange. |
-| `<sp-daygroup>` | `label`, `count?` | Group label dengan garis & chip count. |
-| `<sp-empty>` | `icon`, `title`, `desc?` | Empty state (search no result). |
-| `<sp-load-more>` | `loading?`, `disabled?` | Tombol dashed "Muat sebelumnya". |
-| `<sp-spinner-dots>` | — | 3 dots animation. |
-| `<sp-progress-bar>` | `value: 0..100` | Progress bar gradient. |
-| `<sp-modal>` | `open`, `variant: 'success'\|'warn'`, `icon`, `title`, `body`, `recap?` | Modal overlay dengan animasi pop. |
-| `<sp-toast>` | `open`, `message`, `icon?` | Toast bottom. |
-| `<sp-month-chart>` | `points: ChartPoint[]`, `total: number` | SVG bar chart interaktif + tooltip. |
-| `<sp-icon>` | `name: string` | SVG sprite registry (lihat §8.2). |
-| `<sp-vec-bg>` | `variant: 'dotwave'\|'ringwave'` | Background SVG dekoratif (splash/login/loading). |
-
-### 8.2 Icon Registry
-
-Mockup menyertakan banyak inline SVG. Buat `ICON_REGISTRY: Record<string, string>` di `shared/components/icon/icons.ts`:
+#### `GeolocationService`
 
 ```ts
-export const ICON_REGISTRY = {
-  back: '<path d="M15 6l-6 6 6 6"/>',
-  user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
-  bell: '<path d="M18 8.5a6 6 0 1 0-12 0c0 6-2.2 7.5-2.2 7.5h16.4S18 14.5 18 8.5Z"/><path d="M13.7 19.5a2 2 0 0 1-3.4 0"/>',
-  home: '<path d="m3 10.5 9-7 9 7V20a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 20Z"/><path d="M9.5 21.5v-7h5v7"/>',
-  // ... semua ikon dari mockup
-};
+@Injectable({ providedIn: 'root' })
+export class GeolocationService {
+  getCurrentPosition(highAccuracy = true): Promise<GeoLocation> { /* wrapper around navigator.geolocation.getCurrentPosition */ }
+  watchPosition(cb: (loc: GeoLocation) => void): () => void { /* ... */ }
+}
 ```
 
-`IconComponent` render `<svg viewBox="0 0 24 24" [innerHTML]="path">` (sanitize via `DomSanitizer`).
+Used by: Gate, Check-in form, Clock-in/out.
 
-### 8.3 Pipes & Directives
+#### `CameraService`
 
-| Nama | Tipe | Fungsi |
-|------|------|--------|
-| `InitialsPipe` | pure | `'Rizky Pratama' → 'RP'` |
-| `SlugPipe` | pure | `'Toko Berkah Jaya' → 'Toko_Berkah_Jaya'` (untuk filename unduh) |
-| `FormatTimePipe` | pure | ISO → `'HH:mm'` |
-| `SafeHtmlDirective` | attr | bypass sanitizer untuk SVG string |
+Encapsulates `getUserMedia`, torch capability detection, facing-mode switching, and canvas capture with geo/time stamping. See §10 Camera Feature.
 
----
+#### `ClipboardService`
 
-## 9. Komponen per Layar (Detail)
+Wraps `navigator.clipboard.writeText` with `document.execCommand('copy')` fallback (for older WebViews). Used for referral code copy.
 
-### 9.1 Splash (`features/auth/splash`)
+#### `DownloadService`
 
-**Selector:** `sp-splash`
+Wraps `window.claude.use('downloads')` (PWA download API) when available, falls back to `<a download>` anchor. Used for prospect photo downloads.
 
-**UI:**
-- Background SVG `<sp-vec-bg variant="ringwave">`.
-- Brand logo (webp asset, 210px).
-- Divider orange (52×3).
-- App name "SALES POINT" uppercase, letter-spacing 0.24em.
-- Tagline "Aplikasi akuisisi agen Mini ATM di lapangan".
-- `<sp-spinner-dots>` (bounce animation).
-- Footer: "VisioNet Mini ATM · v1.0.0".
-
-**Behavior:**
-- On init: dispatch `AuthEffects.restoreSession$`.
-- Auto-advance ke `/auth/login` setelah 2.4s (sama dengan mockup `setTimeout`).
-- Jika session valid → `/loading` → `/app/home`.
-- Animasi `rise` (opacity + translateY + scale).
-
-**Inputs/Outputs:** — (route-level component)
-
-**A11y:** `role="status"`, `aria-live="polite"`.
-
----
-
-### 9.2 Login (`features/auth/login`)
-
-**Selector:** `sp-login`
-
-**Form (Reactive):**
+#### `ToastService` (thin wrapper around `UiStore`)
 
 ```ts
-form = this.fb.group({
-  username: ['', [Validators.required]],
-  password: ['', [Validators.required]],
-  remember: [true],
-});
+@Injectable({ providedIn: 'root' })
+export class ToastService {
+  private ui = inject(UiStore);
+  show(message: string, durationMs = 2600): void {
+    this.ui.showToast({ message, visible: true });
+    setTimeout(() => this.ui.hideToast(), durationMs);
+  }
+}
 ```
 
-**UI Structure:**
-- `.login-head.has-vec` → logo (132px) + judul "Masuk ke Sales Point" + subjudul.
-- `.sheet` (white rounded-top) berisi:
-  - Alert error (`*ngIf="loginError"`) — `<sp-icon name="alert">` + pesan.
-  - `<sp-field label="Username" required>` + `<sp-input icon="user" ...>`.
-  - `<sp-field label="Kata Sandi" required>` + `<sp-input icon="lock" type="password" ...>` + toggle password button.
-  - `.checkline`: checkbox "Ingat saya" + link "Lupa kata sandi?".
-  - `<sp-btn variant="primary" icon="arrow-right" [loading]="loading" [disabled]="form.invalid">Masuk</sp-btn>`.
-  - `.demo-note`: petunjuk kredensial demo.
+#### `ScreenTransitionService`
 
-**Behavior:**
-- Submit → dispatch `Login({username, password})`.
-- Pada `AuthEffects` → POST `/auth/login`. Mock demo: validasi `rizky.pratama / salespoint` lokal.
-- Error → set `loginError` dan tampilkan alert merah.
-- Success → `Navigate('/loading')`.
-- Toggle password: ganti `type` antara `password` / `text`, ubah ikon mata.
-- Link "Lupa kata sandi?" → `ToastService.show('Hubungi supervisor area untuk reset kata sandi.')`.
-
-**Validations:**
-- `username`: required, pesan "Username wajib diisi."
-- `password`: required, pesan "Kata sandi wajib diisi."
-- Tidak ada validasi panjang minimum (mockup tidak mensyaratkan).
-
-**A11y:**
-- Label terhubung via `for`/`id`.
-- Tombol toggle password punya `aria-label="Tampilkan/Sembunyikan kata sandi"`.
-- Alert `role="alert"`.
-
----
-
-### 9.3 Loading (`features/auth/loading`)
-
-**Selector:** `sp-loading`
-
-**UI:**
-- Background ringwave.
-- Logo sm.
-- `<sp-progress-bar [value]="pct">`.
-- Persentase besar (`--fs-3xl`).
-- Status text (changes per step).
-
-**Behavior:**
-- On init: subscribe `LoadingService.run(steps)`.
-- Steps (dari mockup JS):
-  ```
-  18%  "Memverifikasi kredensial agen…"
-  42%  "Memuat profil & area kerja…"
-  63%  "Sinkronisasi data absensi…"
-  84%  "Menarik data prospek terbaru…"
-  100% "Siap digunakan"
-  ```
-- Tiap step delay 430–690ms (random).
-- Setelah 100% → wait 420ms → `Navigate('/clock-in')` (atau `/app/home` bila sudah clock-in).
-
----
-
-### 9.4 Clock-In Gate (`features/attendance/gate`)
-
-**Selector:** `sp-clock-in-gate`
-
-**UI:**
-- `.gate-top.has-vec` (gradient navy): logo xs, greeting "Halo, {firstName}", tanggal formatted (`Jumat, 4 September 2026`).
-- `.clock-card` (overlap −30px): badge "Belum absen hari ini", live clock `HH:mm:ss` (font 44px), timezone "WIB · Waktu Indonesia Barat", location chip dengan akurasi ±8m.
-- Card shift info: "Shift hari ini · Reguler · 08:00 – 17:00 WIB".
-- `.gate-actions`: `<sp-btn variant="primary" icon="clock">Clock In Sekarang</sp-btn>` + note kecil.
-
-**Behavior:**
-- Subscribe `GeolocationService.watchAccuracy$()` → update label akurasi.
-- Clock tick via `interval(1000)` (stop saat `OnDestroy`).
-- Tombol Clock In → dispatch `ClockIn({lat,lng,accuracy,selfie?})` (mockup tidak ambil selfie di gate; real impl: redirect ke `/camera/selfie?purpose=clockin`).
-- On success → open modal `<sp-modal variant="success" title="Clock In Berhasil">` dengan recap waktu & lokasi → tombol "Lanjut ke Beranda" → `Navigate('/app/home')`.
-
-**State binding:**
-- `attendance.today$` → greeting, badge, tombol.
-- `ui.clock` (real-time) → tampilan jam.
-
----
-
-### 9.5 Home / Dashboard (`features/home`)
-
-**Selector:** `sp-home`
-
-**UI Sections:**
-
-1. **Header (`.home-head.has-vec`):**
-   - Toprow: logo xs (center) + avatar button (right) → navigate `/app/profile`.
-   - Welcome: "Welcome back," + nama user.
-   - Referral chip (button): icon tag + "Kode Referral" + kode + icon copy. Click → `ClipboardService.copy(referralCode)` + toast.
-
-2. **Body (`.home-body`, margin-top −32px):**
-   - **Stat-solo card:** angka besar prospek hari ini + tanggal.
-   - **Menu grid (2-kolom):**
-     - "Prospek Toko" → `/app/prospek/new`. Icon: ilustrasi webp.
-     - "History Prospek" → `/app/prospek/history`. Icon: ilustrasi webp.
-   - **Attendance card:**
-     - Header (button ke `/app/attendance`): icon OK/warn + "Sudah clock in · {time} WIB" + subjudul + chevron.
-     - Footer: tombol contextual:
-       - Belum clock-in → `btn-green` "Clock In Sekarang".
-       - Sudah in, belum out → `btn-red` "Clock Out Sekarang".
-       - Sudah out → footer hidden.
-
-3. **Bottom nav** (`<sp-bottom-nav active="home" [unread]="unread$ | async">`).
-
-**Behavior:**
-- `selectTodayProspekCount` → angka stat.
-- `selectTodayAttendance` → status tombol.
-- Avatar button → route.
-- Referral chip → `ProfileEffects.copyReferral$`.
-
-**State binding:** `auth.user$`, `prospek.today$`, `attendance.today$`, `notif.unread$`.
-
----
-
-### 9.6 Attendance Detail (`features/attendance/detail`)
-
-**Selector:** `sp-attendance-detail`
-
-**UI:**
-- `<sp-app-bar title="Clock In" subtitle="Absensi kehadiran harian" showBack>` dengan back → `/app/home`.
-- `.today-attend.card`:
-  - Top: tanggal + shift info.
-  - `tt-grid` 2-kolom: Clock In time + Clock Out time (atau "Belum absen" warna abu).
-  - `tt-meta`: lokasi, durasi ("5 jam 34 menit berjalan"), metode "GPS + Selfie · akurasi ±8 m".
-- Tombol `<sp-btn variant="red" icon="logout">Clock Out</sp-btn>` (disabled bila sudah out).
-- Section "Riwayat Absen": list `.attend-row` (date + duration + times arrow).
-- `<sp-load-more>` → load `absenOlder`.
-
-**Behavior:**
-- Durasi live update via `interval(60000)` bila `clockIn && !clockOut`.
-- Clock-out → dispatch `ClockOut()` → toast "Clock out tercatat pukul HH:mm WIB."
-- Load older → dispatch `LoadHistoryOlder()`.
-
----
-
-### 9.7 Prospek Check-In Form (`features/prospek/checkin`)
-
-**Selector:** `sp-prospek-checkin`
-
-**Route:** `/app/prospek/new`
-
-**UI:**
-- `<sp-app-bar title="Prospek Toko" subtitle="Kunjungan ke-{n+1} hari ini · {time} WIB" showBack>`.
-- Location chip: "Lokasi terdeteksi" + coords + alamat reverse + akurasi ±6m.
-- Form:
-  - Nama Toko (required).
-  - Alamat (textarea, required).
-  - Nama PIC (required).
-  - No. Telp PIC (tel, required, min 9 digit numeric).
-  - Photo grid 2-kolom:
-    - `<sp-photo-slot kind="plang" (click)="openCamera('plang')">`.
-    - `<sp-photo-slot kind="selfie" (click)="openCamera('selfie')">`.
-    - Bila sudah ada photo → filled state + tombol retake + tag timestamp.
-  - Catatan (textarea, optional).
-- Sticky footer `.form-foot`: `<sp-btn variant="primary" icon="save">Simpan Prospek</sp-btn>`.
-
-**Reactive Form:**
+Wraps `Router.navigate()` to apply the mockup's `screen-in` animation:
 
 ```ts
-form = this.fb.group({
-  name:    ['', Validators.required],
-  address: ['', Validators.required],
-  picName: ['', Validators.required],
-  picPhone:['', [Validators.required, Validators.pattern(/^[0-9]{9,15}$/)]],
-  note:    [''],
-});
-photos = this.fb.group({
-  plang:  [null as string | null, Validators.required],
-  selfie: [null as string | null, Validators.required],
-});
+@Injectable({ providedIn: 'root' })
+export class ScreenTransitionService {
+  navigate(commands: any[], extras?: NavigationExtras): Promise<boolean> {
+    // Optionally pre-add 'leaving' class to current view
+    return this.router.navigate(commands, extras);
+  }
+}
 ```
 
-**Behavior:**
-- Open camera → `Navigate('/camera/plang')` (atau `'selfie'`). Camera return → `SetDraftPhoto({kind, dataUrl})` → update photo slot.
-- Save:
-  - Validasi semua field + 2 foto.
-  - Bila invalid → mark `.invalid`, scroll ke field pertama, toast "Lengkapi data bertanda * sebelum menyimpan."
-  - Bila valid → dispatch `SaveProspek(form.value, photos.value)`.
-  - On success → open modal success:
-    - Title "Prospek Berhasil Disimpan".
-    - Recap: Nama toko, PIC, No. telp, Waktu, Dokumentasi "2 foto terlampir".
-    - Tombol "Selesai" → reset form + `Navigate('/app/home')`.
-    - Tombol "Check In Lagi" → reset form + scroll top.
-
-**Guards:** `PendingPhotoGuard` tidak relevan di sini (form sendiri), tapi guard dipasang pada route detail.
+The `AppComponent` template listens to `NavigationEnd` and toggles `.active` on the routed `<router-outlet>` container to trigger the `screen-in` keyframe.
 
 ---
 
-### 9.8 Prospek History (`features/prospek/history`)
+## 8. Feature Modules & Components
 
-**Selector:** `sp-prospek-history`
+### 8.1 Auth Feature
 
-**UI:**
-- `<sp-app-bar title="History Prospek" subtitle="{count} prospek hari ini" showBack>`.
-- `<sp-search-bar placeholder="Cari nama toko, alamat, atau PIC">`.
-- Results: grup per hari (`<sp-daygroup>` + list `.pitem`).
-- Tiap item: thumbnail (initials atau foto), nama toko, alamat, meta (time + pic), chevron.
-- `<sp-load-more>` → dispatch `LoadHistoryOlder()`.
-- Empty state bila search no-result.
+#### 8.1.1 `SplashComponent`
+- **Route:** `/auth/splash`
+- **Duration:** ~2.4 s, then auto-redirect to `/auth/login`.
+- **Elements:** Brand logo (WebP asset), divider, app name, tagline, three-dot spinner animation, version footer.
+- **No user interaction.** Reduced-motion: skip spinner animation.
 
-**Behavior:**
-- Search debounce 250ms via `ProspekEffects.search$` → filter lokal di store (data cached).
-- Clear button → reset query, focus search.
-- Click item → `Navigate('/app/prospek/{id}')`.
-- Load older: tambah group dari `prospekOlder` array. Bila habis → disable button + ubah label.
+#### 8.1.2 `LoginComponent`
+- **Route:** `/auth/login`
+- **Form:** Reactive `FormGroup` with `username` (required), `password` (required), `rememberMe` (checkbox, default true).
+- **Behaviour:**
+  - Password visibility toggle button (eye icon swap).
+  - Inline validation error messages (`hint-err`) shown when field touched & invalid.
+  - Login alert banner (`login-alert`) shown on auth failure; message from API or default "Username atau kata sandi salah."
+  - On success → call `LoadingSequenceService.start()` and navigate to `/auth/loading`.
+  - "Lupa kata sandi?" link → toast "Hubungi supervisor area untuk reset kata sandi."
+  - Demo note footer with credentials hint.
+- **Validation:** `username: [required, minLength(3)]`, `password: [required]`.
+
+#### 8.1.3 `LoadingComponent`
+- **Route:** `/auth/loading`
+- **Elements:** Brand logo, percentage text (`load-pct`), progress bar (`load-bar`), status text (`load-status`), footer warning.
+- **Behaviour:** Binds to `LoadingSequenceService` signals. On `ready` (100%), wait 420 ms, then navigate to `/gate` (or `/home` if already clocked in).
+- **Reduced motion:** Progress bar transition duration reduced to ~1 ms.
 
 ---
 
-### 9.9 Prospek Detail (`features/prospek/detail`)
+### 8.2 Gate Feature
 
-**Selector:** `sp-prospek-detail`
+#### `ClockInGateComponent`
+- **Route:** `/gate`
+- **Guard:** `authGuard` (must be authenticated), `clockInGuard` (must NOT yet be clocked in).
+- **Elements:**
+  - Header (vector background, brand logo XS), greeting ("Halo, {firstName}"), today's date.
+  - Live clock card: HH:MM:SS (updates every second via `interval(1000)` → signal).
+  - Badge "Belum absen hari ini".
+  - Location chip: branch name, address, accuracy.
+  - Shift info card.
+  - Primary button "Clock In Sekarang".
+- **Behaviour:**
+  - On mount, fetch `AttendanceStore.today()`. If already clocked in → redirect `/home`.
+  - Button click → `AttendanceStore.clockIn()`:
+    1. Acquire `GeolocationService.getCurrentPosition()`.
+    2. POST to API.
+    3. On success → open `ovClockIn` success modal with recap.
+    4. Modal "Lanjut ke Beranda" → navigate `/home`.
 
-**Route:** `/app/prospek/:id`
+---
 
-**UI:**
-- `<sp-app-bar title="Detail Prospek" subtitle="{storeName}" showBack>` → back ke `/app/prospek/history`.
-- Section "Dokumentasi Foto": 2 `.photo-card` 3:4 (plang + selfie). Click → `Navigate('/photo
+### 8.3 Home Feature
+
+#### `HomeComponent`
+- **Route:** `/home`
+- **Layout:** Scrollable body + sticky bottom nav.
+- **Header (gradient + vector bg):**
+  - Brand logo XS (left-centre), avatar button (right) → navigates `/profile`.
+  - Welcome block: "Welcome back," + agent full name.
+  - Referral chip button → `ClipboardService.copy(referralCode)`.
+- **Body:**
+  - **Stat-solo card:** Big number = `prospectStore.today().length`, label "Prospek hari ini", today's date.
+  - **Menu grid (2 columns):**
+    - "Prospek Toko" tile → `/prospect/new`.
+    - "History Prospek" tile → `/prospect/history`.
+  - **Attendance card:**
+    - Status row (icon + label): "Sudah clock in · 07:48 WIB" or "Belum clock in hari ini".
+    - Action button: "Clock In Sekarang" (green, if not clocked in) OR "Clock Out Sekarang" (red, if clocked in but not out) OR hidden (if both done).
+    - Card body click → `/attendance`.
+- **Bottom nav:** Home (active), Notifikasi (with unread badge), Profil.
+
+---
+
+### 8.4 Attendance Feature
+
+#### `AttendanceComponent`
+- **Route:** `/attendance`
+- **AppBar:** Back button (→ `/home`), title "Clock In", subtitle "Absensi kehadiran harian".
+- **Body:**
+  - Section "Absen Hari Ini":
+    - Card with date, shift, today's clock-in/out times (two cells in `tt-grid`).
+    - Meta rows: location, duration (live updating if clocked in & not out), method.
+    - Clock Out button (red, disabled after clock out).
+  - Section "Riwayat Absen":
+    - List of `attend-row` items (date, duration, in→out times).
+    - "Muat riwayat bulan lalu" load-more button.
+- **Behaviour:** Duration label computed reactively from `clockIn` time and `now` when not yet clocked out.
+
+---
+
+### 8.5 Prospect Feature
+
+#### 8.5.1 `CheckInFormComponent`
+- **Route:** `/prospect/new`
+- **Guard:** `attendanceGuard` (must be clocked in).
+- **AppBar:** Back (→ `/home`), title "Prospek Toko", subtitle "Kunjungan ke-{n} hari ini · {HH:mm} WIB".
+- **Location chip** (auto-detected on init).
+- **Form (Reactive `FormGroup`):**
+
+| Field | Control | Validators |
+|---|---|---|
+| Nama Toko | `storeName` | `required` |
+| Alamat Toko | `address` | `required` |
+| Nama PIC | `picName` | `required` |
+| No. Telp PIC | `picPhone` | `required`, `minLength(9)`, phone pattern |
+| Catatan Kunjungan | `note` | (optional) |
+
+- **Photo grid (2 slots):**
+  - `slotPlang` ("Foto Plang") and `slotSelfie` ("Selfie dengan PIC").
+  - Each slot is a button → navigates to `/prospect/camera` with state `{ kind: 'plang' \| 'selfie' }`.
+  - On return from camera, slot shows captured image, retake button, time tag.
+  - Both photos required to save (custom group validator).
+- **Footer (sticky):** "Simpan Prospek" button.
+- **On submit:**
+  1. Validate all fields + photos.
+  2. If invalid → set `invalid` class on failing fields, scroll first invalid into view, toast "Lengkapi data bertanda * sebelum menyimpan."
+  3. If valid → `ProspectStore.save()`:
+     - Build multipart form-data (photos as `Blob`).
+     - POST to API.
+     - On success → open `ovSuccess` modal with recap (nama toko, PIC, telp, waktu, "2 foto terlampir").
+     - Modal buttons: "Selesai" (→ reset form + navigate `/home`) or "Check In Lagi" (→ reset form, stay).
+
+#### 8.5.2 `HistoryListComponent`
+- **Route:** `/prospect/history`
+- **AppBar:** Back (→ `/home`), title "History Prospek", subtitle "{n} prospek hari ini" (or search result count).
+- **Search bar:**
+  - `<input type="search">` with magnifier icon.
+  - Clear button (X) appears when query non-empty.
+  - Filters across all loaded groups (today + older) by store name, address, PIC name.
+  - Debounced 200 ms via `toSignal(form.valueChanges)`.
+- **List:**
+  - Day groups with label + count badge.
+  - Each item (`pitem`): thumbnail (initials or photo), store name, address, time + PIC meta, chevron.
+  - Click → `/prospect/{id}`.
+- **Load more:** "Muat data sebelumnya" button → `ProspectStore.loadOlder()`. Disables when exhausted.
+
+#### 8.5.3 `ProspectDetailComponent`
+- **Route:** `/prospect/:id`
+- **AppBar:** Back (→ `/prospect/history`), title "Detail Prospek", subtitle = store name.
+- **Sections:**
+  - "Dokumentasi Foto" — 2 photo cards (plang, selfie). Click → `/prospect/viewer?kind={kind}`.
+  - "Data Toko" — info-card rows: nama toko, alamat, PIC, telp, waktu kunjungan, koordinat.
+  - "Catatan Kunjungan" — note box.
+  - Actions: "Unduh Kedua Foto" (primary), "Hubungi PIC" (ghost → `tel:` link).
+- **Behaviour:**
+  - On init → `ProspectStore.selectDetail(id)` fetches from store or API.
+  - If photos not yet loaded (store cache miss), component generates placeholder via `PhotoPlaceholderService` (matches mockup's canvas-generated demo photos).
+
+#### 8.5.4 `CameraCaptureComponent`
+- **Route:** `/prospect/camera`
+- **State:** `{ kind: 'plang' | 'selfie' }` passed via router state or query param.
+- **Elements:**
+  - `<video>` (autoplay, muted, playsinline) with mirror transform when front camera.
+  - Dashed guide overlay.
+  - Top bar: close (X), title, flash toggle.
+  - Hint text (changes by kind).
+  - Bottom bar: gallery button (left), shutter (centre), flip button (right).
+  - Error overlay (when `getUserMedia` fails): message + "Gunakan Foto Contoh" button.
+- **Behaviour:**
+  - On init → request `getUserMedia({ video: { facingMode } })`.
+  - Flip button → toggle `user`/`environment`, restart stream.
+  - Flash toggle → `applyConstraints({ advanced: [{ torch: true }] })` if supported, else toast "Kilat layar aktif".
+  - Shutter:
+    1. Trigger `cam-flash` white-flash animation.
+    2. Draw `<video>` frame to `<canvas>`.
+    3. Apply mirror if front camera.
+    4. Stamp photo (geo + timestamp bar at bottom).
+    5. Convert to JPEG data URL.
+    6. Store in `ProspectStore.photos[kind]`.
+    7. Stop stream, navigate back to `/prospect/new`.
+  - Gallery button → hidden `<input type="file" accept="image/*">`; on file select, read as data URL, stamp, accept.
+  - "Gunakan Foto Contoh" → generate placeholder via canvas (gradient + text), stamp, accept.
+  - Error states: `NotFoundError` (no camera), permission denied → show `camError` overlay with appropriate message.
+- **Lifecycle:** `OnDestroy` stops all tracks to release camera.
+
+#### 8.5.5 `PhotoViewerComponent`
+- **Route:** `/prospect/viewer?kind={plang|selfie}&id={prospectId}`
+- **Elements:**
+  - Full-screen image (`object-fit: contain`).
+  - Top bar: close (X), title, spacer.
+  - Bottom bar: segmented control (Plang / Selfie), download button, hint text.
+- **Behaviour:**
+  - Segment switch swaps displayed photo (from `ProspectStore.detail`).
+  - Download → `DownloadService.save(blob, filename)`.
+  - Close → back to `/prospect/{id}`.
+
+---
+
+### 8.6 Notification Feature
+
+#### `NotificationComponent`
+- **Route:** `/notifications`
+- **AppBar:** Back (→ `/home`), title "Notifikasi", subtitle "{n} belum dibaca" or "Semua sudah dibaca", "mark all read" icon button.
+- **List:**
+  - Day groups with label + unread count badge.
+  - Each notification: coloured icon (green/orange/blue/red), title, body, timestamp, unread dot.
+  - Click → mark as read (removes unread styling + dot, updates badge).
+- **Bottom nav** with active state on Notifikasi.
+
+---
+
+### 8.7 Profile Feature
+
+#### `ProfileComponent`
+- **Route:** `/profile`
+- **Header (gradient + vector):** Back button, large avatar (initials), full name, @username, status badge.
+- **Body:**
+  - **Info card:** username, full name, referral code (with copy button), email.
+  - **Chart card:** "Prospek per Bulan" — custom SVG bar chart (Jan–Sep), total prospek count, legend (completed vs current month). Hoverable bars with tooltip.
+  - **Stats card:** prospek bulan ini (+12% badge), kehadiran bulan ini (good badge).
+  - **Logout button** (danger style) → opens `ovLogout` modal → "Ya, Keluar" confirms.
+  - Version label footer.
+
+---
+
+## 9. Shared / Common Components
+
+| Component | Selector | Props / Inputs | Used in |
+|---|---|---|---|
+| `ButtonComponent` | `app-button` | `variant: 'primary' \| 'ghost' \| 'danger' \| 'red' \| 'green'`, `disabled`, `icon` (SVG path) | Everywhere |
+| `CardComponent` | `app-card` | — | Lists, info panels |
+| `BadgeComponent` | `app-badge` | `variant: 'good' \| 'warn' \| 'crit' \| 'info'`, `pip` | Attendance, notifications, profile |
+| `IconBtnComponent` | `app-icon-btn` | `icon`, `ariaLabel` | AppBars, modals |
+| `InputComponent` | `app-input` | `formControl`, `label`, `icon`, `placeholder`, `required`, `errorText` | Forms |
+| `TextareaComponent` | `app-textarea` | `formControl`, `label`, `rows` | Forms |
+| `FieldComponent` | `app-field` | `label`, `required`, `invalid` (wraps input/textarea) | Forms |
+| `ToastComponent` | `app-toast` | Binds to `UiStore.toast` | Root |
+| `ModalComponent` | `app-modal` | `open`, `variant: 'success' \| 'warn'`, `title`, `body`, slots for actions | Success, clock-in, logout |
+| `OverlayComponent` | `app-overlay` | `open` | Modal host |
+| `PhotoSlotComponent` | `app-photo-slot` | `kind`, `filled`, `image`, `time`, `label` | Check-in form |
+| `PhotoCardComponent` | `app-photo-card` | `src`, `caption` | Detail |
+| `ProspectItemComponent` | `app-prospect-item` | `prospect`, `(click)` | History lists |
+| `NotificationItemComponent` | `app-notif-item` | `notification`, `(read)` | Notification list |
+| `AttendRowComponent` | `app-attend-row` | `record` | Attendance history |
+| `DayGroupComponent` | `app-day-group` | `label`, `count` | History, notifications |
+| `BottomNavComponent` | `app-bottom-nav` | `active: 'home' \| 'notif' \| 'profile'`, `unread` | Home, notifications, profile |
+| `AppBarComponent` | `app-appbar` | `title`, `subtitle`, `backRoute?`, `actions?` | All secondary screens |
+| `ReferralChipComponent` | `app-referral-chip` | `code`, `(copy)` | Home, profile |
+| `MonthlyChartComponent` | `app-monthly-chart` | `data: MonthlyDataPoint[]` | Profile |
+| `SvgBgDirective` | `[appSvgBg]` | `variant: 'dotwave' \| 'ringwave'` | Headers, splash |
+| `ChromeDirective` | `[appChrome]` | reads route data | Root host
