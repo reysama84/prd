@@ -1,774 +1,754 @@
-# Product Requirements Document (PRD) — Backend
-## Sales Point (VisioNet Mini ATM) — .NET API
+# Product Requirements Document (PRD) — Sales Point Backend (.NET)
 
-**Version:** 1.0.0 | **Last Updated:** 2026-09-04 | **Status:** Draft
+> **Produk**: VisioNet Mini ATM — Sales Point
+> **Platform Backend**: ASP.NET Core Web API (.NET 8)
+> **Target Audience**: Field Sales Agents (akuisisi agen Mini ATM)
+> **Versi Dokumen**: 1.0.0
 
 ---
 
 ## 1. Overview
 
-### 1.1 Purpose
-This document defines the backend API specification and business logic for the **Sales Point** mobile web application — a field-agent tool used by VisioNet Mini ATM sales agents to log daily attendance (clock-in/out), record store acquisition prospects with photo documentation, and track performance.
+### 1.1 Tujuan
+Menyediakan REST API backend untuk aplikasi mobile **Sales Point** yang digunakan oleh agen lapangan VisioNet Mini ATM. Backend menangani autentikasi agen, absensi berbasis GPS+selfie, pencatatan prospek toko, manajemen dokumentasi foto, notifikasi, serta pelaporan performa agen.
 
-### 1.2 Tech Stack
-| Layer | Technology |
+### 1.2 Lingkup
+PRD ini hanya mencakup **backend**. Frontend/mobile, infrastruktur deployment, dan integrasi pihak ketiga di luar lingkup dokumen ini.
+
+### 1.3 Asumsi Teknis
+- **Framework**: ASP.NET Core 8 Web API
+- **ORM**: Entity Framework Core 8 (SQL Server / PostgreSQL)
+- **Auth**: JWT Bearer Token + Refresh Token
+- **File Storage**: Azure Blob Storage / AWS S3 (abstraksi via `IFileStorageService`)
+- **Time Zone**: WIB (UTC+7), disimpan sebagai UTC di database
+- **API Convention**: RESTful, versioning via URL `/api/v1/...`
+- **Response Format**: `application/json`, snake_case atau camelCase (System.Text.Json default camelCase)
+
+---
+
+## 2. Arsitektur Backend
+
+### 2.1 Layered Architecture
+```
+SalesPoint.API          → Controllers, Middleware, Filters
+SalesPoint.Application  → Services, DTOs, Interfaces, Validators
+SalesPoint.Domain       → Entities, Enums, Domain Events
+SalesPoint.Infrastructure → EF Core DbContext, Repositories, External Services
+```
+
+### 2.2 Cross-Cutting Concerns
+| Concern | Implementation |
 |---|---|
-| Framework | .NET 8 Web API |
-| Language | C# 12 |
-| ORM | Entity Framework Core 8 |
-| Database | SQL Server / PostgreSQL |
-| Auth | JWT Bearer Tokens |
-| File Storage | Local / Azure Blob / AWS S3 (abstracted) |
-| Logging | Serilog |
+| Logging | Serilog (structured logging) |
 | Validation | FluentValidation |
-| Docs | Swagger / OpenAPI 3.0 |
+| Error Handling | Global exception middleware → RFC 7807 ProblemDetails |
+| Rate Limiting | `AspNetCoreRateLimit` (per-endpoint) |
+| Caching | `IDistributedCache` (Redis) untuk lookup master & session |
+| Audit Trail | `AuditableEntity` base (CreatedAt, CreatedBy, UpdatedAt, UpdatedBy) |
 
-### 1.3 Architecture Pattern
-Clean Architecture — **Controllers → Application Services → Repositories / Domain**.
-
----
-
-## 2. Authentication & Authorization
-
-### 2.1 Auth Flow
-- **Method:** JWT Bearer Token
-- **Token Lifetime:** Access = 8 hours, Refresh = 7 days
-- **Claim Payload:** `agentId`, `username`, `fullName`, `role`, `branchId`
-- **Header:** `Authorization: Bearer {token}`
-
-### 2.2 Roles
-| Role | Scope |
-|---|---|
-| `Agent` | Own data only (attendance, prospects, profile) |
-| `Supervisor` | View agents in assigned branch, manage notifications |
-| `Admin` | Full system access |
-
-### 2.3 Endpoints — Auth
-
-| # | Method | Endpoint | Auth | Description |
-|---|---|---|---|---|
-| 1 | POST | `/api/auth/login` | No | Authenticate agent credentials |
-| 2 | POST | `/api/auth/refresh` | Refresh Token | Refresh expired access token |
-| 3 | POST | `/api/auth/logout` | Bearer | Revoke refresh token |
-| 4 | GET | `/api/auth/me` | Bearer | Get current authenticated user profile |
-
-### 2.4 DTOs
-
-```csharp
-// LoginRequestDto
-public record LoginRequestDto
-{
-    [Required] public string Username { get; init; }
-    [Required] public string Password { get; init; }
-    public bool RememberMe { get; init; }
-}
-
-// LoginResponseDto
-public record LoginResponseDto(
-    string AccessToken,
-    string RefreshToken,
-    DateTime ExpiresAt,
-    AgentProfileDto Profile
-);
-
-// AgentProfileDto
-public record AgentProfileDto(
-    Guid AgentId,
-    string Username,
-    string FullName,
-    string Email,
-    string ReferralCode,
-    string Role,
-    string BranchName,
-    string Status
-);
-```
-
-### 2.5 Business Rules
-- Login attempt rate limit: **5 failed attempts per 5 minutes** per IP+username, then lock for 15 minutes.
-- Passwords hashed using **BCrypt** (cost 12).
-- Refresh tokens stored in DB with `RevokedAt` nullable; rotation on every refresh.
+### 2.3 Dependency Injection
+Semua services terdaftar di `Program.cs` dengan lifetime berikut:
+- **Scoped**: `DbContext`, services per-request (Application Services, Repositories)
+- **Singleton**: `ILogger`, `IConfiguration`, `IMemoryCache`
+- **Transient**: `IValidator<T>`, mappers
 
 ---
 
-## 3. Controllers & API Endpoints
+## 3. Data Model (Domain Entities)
 
-### 3.1 Endpoint Summary
+### 3.1 Entities
 
-| Controller | Route Prefix | Endpoints |
-|---|---|---|
-| `AuthController` | `/api/auth` | login, refresh, logout, me |
-| `AttendanceController` | `/api/attendance` | clock-in, clock-out, today, history, history-older |
-| `ProspectController` | `/api/prospects` | create, list, detail, search, older |
-| `PhotoController` | `/api/photos` | upload, download, download-all |
-| `NotificationController` | `/api/notifications` | list, mark-read, mark-all-read, unread-count |
-| `ProfileController` | `/api/profile` | get, referral, monthly-stats |
-| `ReferenceController` | `/api/reference` | branches, shifts |
-
----
-
-### 3.2 AttendanceController
-
-#### Endpoints
-
-| # | Method | Endpoint | Auth | Description |
-|---|---|---|---|---|
-| 1 | POST | `/api/attendance/clock-in` | Bearer | Record clock-in with GPS + selfie ref |
-| 2 | POST | `/api/attendance/clock-out` | Bearer | Record clock-out with GPS |
-| 3 | GET | `/api/attendance/today` | Bearer | Get today's attendance record |
-| 4 | GET | `/api/attendance/history?page=1&size=10` | Bearer | Paginated attendance history |
-| 5 | GET | `/api/attendance/history/older?month={yyyy-MM}` | Bearer | Older month records |
-
-#### DTOs
-
+#### Agent (User)
 ```csharp
-public record ClockInRequestDto(
-    [Required] decimal Latitude,
-    [Required] decimal Longitude,
-    [Required] decimal AccuracyMeters,
-    [Required] string BranchName,
-    string Address,
-    string SelfiePhotoId  // references uploaded photo
-);
-
-public record ClockOutRequestDto(
-    [Required] decimal Latitude,
-    [Required] decimal Longitude,
-    [Required] decimal AccuracyMeters
-);
-
-public record AttendanceDto(
-    Guid Id,
-    DateTime? ClockInTime,
-    DateTime? ClockOutTime,
-    string BranchName,
-    string Address,
-    decimal? Latitude,
-    decimal? Longitude,
-    decimal? AccuracyMeters,
-    string Method,       // "GPS + Selfie"
-    string Status,       // "Tepat waktu", "Terlambat", "Izin"
-    TimeSpan? Duration,
-    string ShiftStart,
-    string ShiftEnd
-);
-
-public record AttendanceListDto(
-    List<AttendanceDto> Items,
-    int TotalCount,
-    int Page,
-    int PageSize
-);
-```
-
-#### Business Rules
-- One clock-in per agent per calendar day; reject duplicates with `409 Conflict`.
-- Clock-in time vs shift start (`08:00`) determines status:
-  - `< 08:00` → `On Time` / `Tepat Waktu`
-  - `>= 08:00` → `Late` / `Terlambat` (store delta minutes)
-- Clock-out only allowed if clock-in exists for today; reject if already clocked out (`409`).
-- GPS geofence: reject clock-in if agent distance > **500m** from assigned branch coordinates (return `400` with `ERR_GEOFENCE_VIOLATION`).
-- Duration auto-calculated on clock-out: `ClockOutTime - ClockInTime`.
-
----
-
-### 3.3 ProspectController
-
-#### Endpoints
-
-| # | Method | Endpoint | Auth | Description |
-|---|---|---|---|---|
-| 1 | POST | `/api/prospects` | Bearer | Create new prospect visit |
-| 2 | GET | `/api/prospects/today` | Bearer | List today's prospects |
-| 3 | GET | `/api/prospects?page=1&size=10` | Bearer | Paginated list |
-| 4 | GET | `/api/prospects/search?q={query}` | Bearer | Search by name/address/PIC |
-| 5 | GET | `/api/prospects/{id}` | Bearer | Prospect detail with photos |
-| 6 | GET | `/api/prospects/older?day={date}` | Bearer | Prospects from prior dates |
-
-#### DTOs
-
-```csharp
-public record CreateProspectRequestDto(
-    [Required] string StoreName,
-    [Required] string Address,
-    [Required] string PicName,
-    [Required][Phone] string PicPhone,
-    [Required] string PhotoPlangId,   // uploaded photo ID
-    [Required] string PhotoSelfieId,  // uploaded photo ID
-    string? Notes,
-    decimal? Latitude,
-    decimal? Longitude,
-    decimal? AccuracyMeters
-);
-
-public record ProspectDto(
-    Guid Id,
-    string StoreName,
-    string Address,
-    string PicName,
-    string PicPhone,
-    string VisitTime,    // "HH:mm"
-    DateTime VisitDate,
-    string? Notes,
-    string Status,       // "Terverifikasi", "Menunggu verifikasi", "Ditolak"
-    PhotoDto PhotoPlang,
-    PhotoDto PhotoSelfie,
-    string Coordinates   // "-6.26412, 106.79931"
-);
-
-public record ProspectListItemDto(
-    Guid Id,
-    string StoreName,
-    string Address,
-    string PicName,
-    string VisitTime,
-    DateTime VisitDate,
-    string Status,
-    string StatusClass   // "good", "warn", "crit"
-);
-
-public record ProspectListDto(
-    List<ProspectGroupDto> Groups,
-    int TotalCount
-);
-
-public record ProspectGroupDto(
-    string DateLabel,    // "Hari Ini — Jumat, 4 September 2026"
-    List<ProspectListItemDto> Items
-);
-```
-
-#### Business Rules
-- Prospect creation **requires** clock-in to exist for the current day (`403 Forbidden` if not clocked in).
-- `PicPhone` validated: numeric, **min 9 digits**, normalize to `08xxxxxxxxxx`.
-- Both photo IDs (`PhotoPlangId`, `PhotoSelfieId`) must exist and belong to the uploading agent (`400` if missing).
-- New prospects default to status `Menunggu verifikasi`.
-- Duplicate detection: same `StoreName + Address` within same day → warn but allow (`409 Conflict` optional).
-- Auto-stamp photo metadata (GPS coordinates, timestamp) on upload.
-
----
-
-### 3.4 PhotoController
-
-#### Endpoints
-
-| # | Method | Endpoint | Auth | Description |
-|---|---|---|---|---|
-| 1 | POST | `/api/photos` | Bearer | Upload photo (multipart/form-data) |
-| 2 | GET | `/api/photos/{id}` | Bearer | Download photo (returns image/jpeg) |
-| 3 | GET | `/api/photos/{id}/metadata` | Bearer | Get photo metadata only |
-| 4 | GET | `/api/photos/prospect/{prospectId}/all` | Bearer | Get all photos for a prospect |
-
-#### DTOs
-
-```csharp
-public record PhotoUploadRequestDto(
-    IFormFile File,
-    string PhotoType,    // "plang" | "selfie"
-    decimal? Latitude,
-    decimal? Longitude,
-    decimal? AccuracyMeters
-);
-
-public record PhotoDto(
-    Guid Id,
-    string Url,
-    string PhotoType,
-    DateTime CapturedAt,
-    string? Latitude,
-    string? Longitude,
-    string? Address,
-    string FileName
-);
-```
-
-#### Business Rules
-- Max file size: **10 MB**.
-- Allowed types: `image/jpeg`, `image/png`, `image/webp`.
-- Store original + generate thumbnail (320px width) for list views.
-- Inject metadata watermark (timestamp + GPS) server-side on upload.
-- Files stored in abstracted `IPhotoStorage` (local disk / blob / S3).
-
----
-
-### 3.5 NotificationController
-
-| # | Method | Endpoint | Auth | Description |
-|---|---|---|---|---|
-| 1 | GET | `/api/notifications` | Bearer | Grouped notification list |
-| 2 | POST | `/api/notifications/{id}/read` | Bearer | Mark single as read |
-| 3 | POST | `/api/notifications/read-all` | Bearer | Mark all as read |
-| 4 | GET | `/api/notifications/unread-count` | Bearer | Badge count only |
-
-#### DTOs
-
-```csharp
-public record NotificationDto(
-    Guid Id,
-    string Title,
-    string Body,
-    string IconType,   // "green", "orange", "blue", "red"
-    DateTime CreatedAt,
-    string TimeLabel,  // "12:05 WIB"
-    bool IsRead
-);
-
-public record NotificationGroupDto(
-    string DateLabel,  // "Hari Ini", "Kemarin", or full date
-    List<NotificationDto> Items
-);
-```
-
-#### Business Rules
-- Notifications auto-generated on events:
-  - Prospect created → `green` "Prospek tersimpan"
-  - Clock-in recorded → `blue` "Clock in tercatat"
-  - Approaching clock-out deadline (16:00 WIB) → `orange` "Jangan lupa clock out"
-  - Prospect verified/rejected by supervisor → `green`/`red`
-- Grouped by date: Today, Yesterday, then full dates.
-
----
-
-### 3.6 ProfileController
-
-| # | Method | Endpoint | Auth | Description |
-|---|---|---|---|---|
-| 1 | GET | `/api/profile` | Bearer | Full agent profile |
-| 2 | GET | `/api/profile/referral` | Bearer | Referral code + copy |
-| 3 | GET | `/api/profile/monthly-stats?year=2026` | Bearer | Bar chart data |
-| 4 | GET | `/api/profile/summary` | Bearer | Current month prospek + attendance % |
-
-#### DTOs
-
-```csharp
-public record ProfileDetailDto(
-    Guid AgentId,
-    string Username,
-    string FullName,
-    string Email,
-    string ReferralCode,
-    string Role,
-    string Status,
-    string BranchName,
-    string AvatarInitials
-);
-
-public record MonthlyStatItemDto(
-    string Month,       // "Jan", "Feb", ...
-    int Count,
-    bool IsCurrentMonth
-);
-
-public record MonthlyStatsDto(
-    List<MonthlyStatItemDto> Months,
-    int TotalProspects,
-    int CurrentMonthProspects,
-    decimal MonthOverMonthChange  // +12%, -5%, etc.
-);
-
-public record ProfileSummaryDto(
-    int CurrentMonthProspects,
-    decimal AttendanceRate,      // percentage
-    int AttendanceDays,
-    string Trend                 // "+12%"
-);
-```
-
-#### Business Rules
-- Referral code format: `SP-{INITIALS}{AGENT_NUMBER_4_DIGITS}` (e.g., `SP-RZK2041`), generated once at agent registration.
-- Monthly stats aggregated from `Prospects` table grouped by month; current month flagged `IsCurrentMonth = true`.
-
----
-
-## 4. Service Layer
-
-### 4.1 Service Interfaces
-
-```csharp
-public interface IAuthService
-{
-    Task<LoginResponseDto> LoginAsync(LoginRequestDto req, string ipAddress);
-    Task<LoginResponseDto> RefreshAsync(string refreshToken);
-    Task LogoutAsync(Guid agentId);
-    Task<AgentProfileDto> GetMeAsync(Guid agentId);
-}
-
-public interface IAttendanceService
-{
-    Task<AttendanceDto> ClockInAsync(Guid agentId, ClockInRequestDto req);
-    Task<AttendanceDto> ClockOutAsync(Guid agentId, ClockOutRequestDto req);
-    Task<AttendanceDto?> GetTodayAsync(Guid agentId);
-    Task<AttendanceListDto> GetHistoryAsync(Guid agentId, int page, int size);
-    Task<AttendanceListDto> GetOlderHistoryAsync(Guid agentId, string month);
-}
-
-public interface IProspectService
-{
-    Task<ProspectDto> CreateAsync(Guid agentId, CreateProspectRequestDto req);
-    Task<List<ProspectListItemDto>> GetTodayAsync(Guid agentId);
-    Task<ProspectListDto> GetListAsync(Guid agentId, int page, int size);
-    Task<ProspectListDto> SearchAsync(Guid agentId, string query);
-    Task<ProspectDto> GetByIdAsync(Guid agentId, Guid prospectId);
-    Task<ProspectListDto> GetOlderAsync(Guid agentId, DateTime date);
-}
-
-public interface IPhotoService
-{
-    Task<PhotoDto> UploadAsync(Guid agentId, PhotoUploadRequestDto req);
-    Task<(byte[] Data, string ContentType)> DownloadAsync(Guid agentId, Guid photoId);
-    Task<List<PhotoDto>> GetByProspectAsync(Guid agentId, Guid prospectId);
-}
-
-public interface INotificationService
-{
-    Task<List<NotificationGroupDto>> GetAllAsync(Guid agentId);
-    Task MarkReadAsync(Guid agentId, Guid notificationId);
-    Task MarkAllReadAsync(Guid agentId);
-    Task<int> GetUnreadCountAsync(Guid agentId);
-    Task CreateAsync(Guid agentId, string title, string body, string iconType);
-}
-
-public interface IProfileService
-{
-    Task<ProfileDetailDto> GetProfileAsync(Guid agentId);
-    Task<MonthlyStatsDto> GetMonthlyStatsAsync(Guid agentId, int year);
-    Task<ProfileSummaryDto> GetSummaryAsync(Guid agentId);
-}
-```
-
-### 4.2 Key Business Logic
-
-#### Attendance — Geofence Validation
-```csharp
-public async Task<AttendanceDto> ClockInAsync(Guid agentId, ClockInRequestDto req)
-{
-    // 1. Check if already clocked in today
-    var existing = await _repo.GetTodayAsync(agentId);
-    if (existing?.ClockInTime != null)
-        throw new ConflictException("Already clocked in today.");
-
-    // 2. Validate geofence (distance to branch)
-    var branch = await _branchRepo.GetByAgentAsync(agentId);
-    var distance = GeoHelper.HaversineDistance(
-        req.Latitude, req.Longitude,
-        branch.Latitude, branch.Longitude);
-    
-    if (distance > 500m)
-        throw new BadRequestException("ERR_GEOFENCE_VIOLATION",
-            $"You are {distance:F0}m from your branch. Max allowed: 500m.");
-
-    // 3. Determine status based on shift
-    var clockInTime = DateTime.UtcNow.ToWIB();
-    var shiftStart = TimeSpan.Parse("08:00");
-    var isLate = clockInTime.TimeOfDay > shiftStart;
-    var status = isLate
-        ? $"Terlambat {(clockInTime.TimeOfDay - shiftStart).TotalMinutes:F0} m"
-        : "Tepat waktu";
-
-    // 4. Save
-    var attendance = new Attendance { /* ... */ };
-    await _repo.AddAsync(attendance);
-
-    // 5. Auto-create notification
-    await _notifService.CreateAsync(agentId, "Clock in tercatat",
-        $"Absen masuk pukul {clockInTime:HH:mm} WIB di {req.BranchName} berhasil disimpan.",
-        "blue");
-
-    return MapToDto(attendance);
-}
-```
-
-#### Prospect — Creation Guard
-```csharp
-public async Task<ProspectDto> CreateAsync(Guid agentId, CreateProspectRequestDto req)
-{
-    // Must be clocked in today
-    var today = await _attendanceService.GetTodayAsync(agentId);
-    if (today?.ClockInTime == null)
-        throw new ForbiddenException("ERR_NOT_CLOCKED_IN",
-            "You must clock in before creating prospects.");
-
-    // Validate photos belong to agent
-    await _photoService.ValidateOwnershipAsync(agentId, req.PhotoPlangId, req.PhotoSelfieId);
-
-    // Normalize phone
-    var normalizedPhone = PhoneNormalizer.Normalize(req.PicPhone);
-
-    // Create
-    var prospect = new Prospect { /* ... */ };
-    await _repo.AddAsync(prospect);
-
-    // Auto notification
-    await _notifService.CreateAsync(agentId, "Prospek tersimpan",
-        $"Data {req.StoreName} berhasil masuk ke sistem Mini ATM.", "green");
-
-    return MapToDto(prospect);
-}
-```
-
----
-
-## 5. Data Model (EF Core Entities)
-
-```csharp
-public class Agent
+public class Agent : AuditableEntity
 {
     public Guid Id { get; set; }
-    public string Username { get; set; }
+    public string Username { get; set; }          // unique, max 50
     public string PasswordHash { get; set; }
-    public string FullName { get; set; }
-    public string Email { get; set; }
-    public string ReferralCode { get; set; }
-    public string Role { get; set; }        // "Agent", "Supervisor", "Admin"
-    public string Status { get; set; }      // "Aktif", "Nonaktif"
-    public Guid BranchId { get; set; }
-    public Branch? Branch { get; set; }
-    public DateTime CreatedAt { get; set; }
-    public DateTime? LockedUntil { get; set; }
-    public int FailedLoginAttempts { get; set; }
-
+    public string FullName { get; set; }           // max 150
+    public string Email { get; set; }              // unique
+    public string PhoneNumber { get; set; }        // E.164
+    public string ReferralCode { get; set; }       // "SP-RZK2041"
+    public Guid? BranchId { get; set; }
+    public AgentStatus Status { get; set; }         // Active, Suspended, Inactive
+    public DateTimeOffset? LastLoginAt { get; set; }
     public ICollection<Attendance> Attendances { get; set; }
     public ICollection<Prospect> Prospects { get; set; }
     public ICollection<RefreshToken> RefreshTokens { get; set; }
 }
+```
 
-public class Branch
+#### Branch (Kantor Cabang)
+```csharp
+public class Branch : AuditableEntity
 {
     public Guid Id { get; set; }
-    public string Name { get; set; }
+    public string Name { get; set; }                // "Jakarta Selatan"
     public string Address { get; set; }
-    public decimal Latitude { get; set; }
-    public decimal Longitude { get; set; }
-    public string ShiftStart { get; set; }   // "08:00"
-    public string ShiftEnd { get; set; }     // "17:00"
-    public ICollection<Agent> Agents { get; set; }
+    public double Latitude { get; set; }
+    public double Longitude { get; set; }
+    public double GeoFenceRadiusMeters { get; set; } // default 200m
+    public TimeSpan ShiftStart { get; set; }         // 08:00
+    public TimeSpan ShiftEnd { get; set; }            // 17:00
 }
+```
 
-public class Attendance
+#### Attendance
+```csharp
+public class Attendance : AuditableEntity
 {
     public Guid Id { get; set; }
     public Guid AgentId { get; set; }
-    public DateTime Date { get; set; }
-    public DateTime? ClockInTime { get; set; }
-    public DateTime? ClockOutTime { get; set; }
-    public decimal? Latitude { get; set; }
-    public decimal? Longitude { get; set; }
-    public decimal? AccuracyMeters { get; set; }
-    public string BranchName { get; set; }
-    public string Address { get; set; }
-    public string Method { get; set; }       // "GPS + Selfie"
-    public string Status { get; set; }
-    public TimeSpan? Duration { get; set; }
-    public Agent? Agent { get; set; }
+    public DateTimeOffset Date { get; set; }       // date only (WIB)
+    public DateTimeOffset? ClockInAt { get; set; }
+    public DateTimeOffset? ClockOutAt { get; set; }
+    public double? ClockInLat { get; set; }
+    public double? ClockInLng { get; set; }
+    public double? ClockOutLat { get; set; }
+    public double? ClockOutLng { get; set; }
+    public string ClockInPhotoUrl { get; set; }    // selfie URL
+    public string ClockOutPhotoUrl { get; set; }
+    public double? GpsAccuracyMeters { get; set; }
+    public AttendanceStatus Status { get; set; }   // OnTime, Late, Izin, Missed
+    public TimeSpan? Duration => ClockOutAt - ClockInAt;
+    public Agent Agent { get; set; }
 }
+```
 
-public class Prospect
+#### Prospect (Prospek Toko)
+```csharp
+public class Prospect : AuditableEntity
 {
     public Guid Id { get; set; }
     public Guid AgentId { get; set; }
     public string StoreName { get; set; }
     public string Address { get; set; }
     public string PicName { get; set; }
-    public string PicPhone { get; set; }
-    public DateTime VisitDate { get; set; }
-    public string VisitTime { get; set; }    // "HH:mm"
-    public string? Notes { get; set; }
-    public string Status { get; set; }        // "Menunggu verifikasi", "Terverifikasi", "Ditolak"
-    public decimal? Latitude { get; set; }
-    public decimal? Longitude { get; set; }
-    public Guid? PhotoPlangId { get; set; }
-    public Guid? PhotoSelfieId { get; set; }
-    public Photo? PhotoPlang { get; set; }
-    public Photo? PhotoSelfie { get; set; }
-    public Agent? Agent { get; set; }
-    public DateTime CreatedAt { get; set; }
+    public string PicPhone { get; set; }            // E.164
+    public string Notes { get; set; }
+    public double Latitude { get; set; }
+    public double Longitude { get; set; }
+    public double GpsAccuracyMeters { get; set; }
+    public DateTimeOffset VisitedAt { get; set; }
+    public string PlangPhotoUrl { get; set; }       // foto papan nama
+    public string SelfiePhotoUrl { get; set; }      // selfie + PIC
+    public ProspectStatus Status { get; set; }       // New, Verified, Rejected, Installed
+    public Agent Agent { get; set; }
 }
+```
 
-public class Photo
-{
-    public Guid Id { get; set; }
-    public Guid AgentId { get; set; }
-    public string FileName { get; set; }
-    public string FilePath { get; set; }
-    public string ThumbnailPath { get; set; }
-    public string PhotoType { get; set; }    // "plang", "selfie"
-    public DateTime CapturedAt { get; set; }
-    public decimal? Latitude { get; set; }
-    public decimal? Longitude { get; set; }
-    public string? Address { get; set; }
-    public Agent? Agent { get; set; }
-}
-
-public class Notification
+#### Notification
+```csharp
+public class Notification : AuditableEntity
 {
     public Guid Id { get; set; }
     public Guid AgentId { get; set; }
     public string Title { get; set; }
     public string Body { get; set; }
-    public string IconType { get; set; }
-    public DateTime CreatedAt { get; set; }
-    public DateTime? ReadAt { get; set; }
-    public Agent? Agent { get; set; }
+    public NotificationType Type { get; set; }       // ProspectSaved, ClockReminder, BonusPaid, etc.
+    public bool IsRead { get; set; }
+    public DateTimeOffset? ReadAt { get; set; }
+    public string PayloadJson { get; set; }          // additional context
 }
+```
 
-public class RefreshToken
+#### RefreshToken
+```csharp
+public class RefreshToken : AuditableEntity
 {
     public Guid Id { get; set; }
     public Guid AgentId { get; set; }
-    public string Token { get; set; }
-    public DateTime ExpiresAt { get; set; }
-    public DateTime? RevokedAt { get; set; }
-    public string? ReplacedByToken { get; set; }
-    public string? IpAddress { get; set; }
+    public string Token { get; set; }                 // hashed
+    public DateTimeOffset ExpiresAt { get; set; }
+    public DateTimeOffset? RevokedAt { get; set; }
+    public string ReplacedByToken { get; set; }
+    public string CreatedByIp { get; set; }
+    public bool IsActive => RevokedAt == null && DateTime.UtcNow <= ExpiresAt;
+}
+```
+
+### 3.2 Enums
+```csharp
+public enum AgentStatus { Active, Suspended, Inactive }
+public enum AttendanceStatus { OnTime, Late, Izin, Missed, Completed }
+public enum ProspectStatus { New, Verified, Rejected, Installed }
+public enum NotificationType { ProspectSaved, ClockReminder, ClockIn, ClockOut, BonusPaid, AppUpdate, Briefing }
+```
+
+---
+
+## 4. Authentication & Authorization
+
+### 4.1 Strategy
+- **JWT Bearer Token** untuk autentikasi stateless (access token, TTL 15 menit)
+- **Refresh Token** (TTL 7 hari) disimpan hashed di DB, rotation on use
+- **Password Policy**: BCrypt hash (cost 11), min 8 karakter, lockout setelah 5 percobaan gagal
+- **Claim-based authorization**: `AgentId`, `BranchId`, `Role` (`Agent`, `Supervisor`, `Admin`)
+
+### 4.2 Endpoints Auth
+
+#### `POST /api/v1/auth/login`
+**Request DTO**:
+```csharp
+public record LoginRequest(
+    [property: Required] string Username,
+    [property: Required] string Password,
+    bool RememberMe);
+```
+**Business Rules**:
+1. Cari agent by `Username` (case-insensitive) dengan `Status == Active`
+2. Verifikasi password via `BCrypt.Verify`
+3. Jika gagal → increment `FailedLoginAttempts`; jika ≥5 → `Status = Suspended` selama 15 menit
+4. Jika sukses → reset attempts, update `LastLoginAt`, generate access+refresh token
+5. Return token pair
+
+**Response DTO**:
+```csharp
+public record LoginResponse(
+    Guid AgentId,
+    string AccessToken,
+    string RefreshToken,
+    DateTimeOffset ExpiresAt,
+    string ReferralCode,
+    string FullName);
+```
+**Errors**: `401 InvalidCredentials`, `423 AccountLocked`
+
+#### `POST /api/v1/auth/refresh`
+```csharp
+public record RefreshRequest(string AccessToken, string RefreshToken);
+```
+Validasi refresh token aktif, rotate, return token baru. Invalidasi token lama.
+
+#### `POST /api/v1/auth/logout`
+Revoke aktif refresh token berdasarkan `AgentId` dari claim. Idempotent.
+
+#### `POST /api/v1/auth/forgot-password`
+Trigger workflow reset password (kirim OTP ke email/phone). Di luar lingkup penuh PRD ini — endpoint stub.
+
+### 4.3 Authorization Policies
+```csharp
+builder.Services.AddAuthorization(opts =>
+{
+    opts.AddPolicy("AgentOnly", p => p.RequireRole("Agent"));
+    opts.AddPolicy("SupervisorOrAdmin", p => p.RequireRole("Supervisor", "Admin"));
+    opts.AddPolicy("OwnerOrSupervisor", p => p.Requirements.Add(new OwnerOrSupervisorRequirement()));
+});
+```
+Custom handler `OwnerOrSupervisorHandler` memeriksa apakah `AgentId` di route sama dengan claim `AgentId`, atau role `Supervisor`/`Admin`.
+
+---
+
+## 5. API Endpoints
+
+> Semua endpoint (kecuali `/auth/login`, `/auth/refresh`) memerlukan header `Authorization: Bearer {token}`.
+> Response sukses menggunakan `200 OK` / `201 Created`. Error menggunakan RFC 7807.
+
+### 5.1 Agent / Profile
+
+| Method | Endpoint | Deskripsi | Auth |
+|---|---|---|---|
+| `GET` | `/api/v1/agents/me` | Profil agen login + referral code | Agent |
+| `PUT` | `/api/v1/agents/me` | Update profil (fullName, email, phone) | Agent |
+| `GET` | `/api/v1/agents/me/stats` | Statistik bulan berjalan (jumlah prospek, kehadiran %) | Agent |
+| `GET` | `/api/v1/agents/me/prospects/monthly?year={year}` | Agregat prospek per bulan untuk chart | Agent |
+| `POST` | `/api/v1/agents/me/referral/copy` | Log event copy referral (no state change) | Agent |
+
+#### `GET /api/v1/agents/me` Response
+```csharp
+public record AgentProfileDto(
+    Guid Id,
+    string Username,
+    string FullName,
+    string Email,
+    string PhoneNumber,
+    string ReferralCode,
+    string Role,
+    string Status,
+    string BranchName);
+```
+
+#### `GET /api/v1/agents/me/prospects/monthly?year=2026` Response
+```csharp
+public record MonthlyProspectDto(string Month, int Count, bool IsCurrentMonth);
+public record MonthlyProspectChartResponse(int Year, int Total, List<MonthlyProspectDto> Months);
+```
+**Logic**: Group `Prospects` by `VisitedAt` (month, WIB), hitung count per bulan, tandai bulan berjalan. Cache 5 menit per `AgentId`.
+
+### 5.2 Attendance (Absensi)
+
+| Method | Endpoint | Deskripsi | Auth |
+|---|---|---|---|
+| `GET` | `/api/v1/attendance/today` | Status absen hari ini | Agent |
+| `POST` | `/api/v1/attendance/clock-in` | Clock in (GPS + selfie) | Agent |
+| `POST` | `/api/v1/attendance/clock-out` | Clock out | Agent |
+| `GET` | `/api/v1/attendance/history?from={date}&to={date}&page={n}` | Riwayat absen (paginated) | Agent |
+| `GET` | `/api/v1/attendance/{id}` | Detail absen | OwnerOrSupervisor |
+
+#### `POST /api/v1/attendance/clock-in`
+**Request DTO** (`multipart/form-data`):
+```csharp
+public class ClockInRequest
+{
+    [Required] public double Latitude { get; set; }
+    [Required] public double Longitude { get; set; }
+    [Required] public IFormFile SelfiePhoto { get; set; }
+    public double? GpsAccuracyMeters { get; set; }
+}
+```
+**Business Rules (Service: `AttendanceService.ClockInAsync`)**:
+1. Cek apakah sudah ada `Attendance` hari ini untuk agent → jika sudah clock-in → `409 Conflict`
+2. Ambil `Branch` agent, hitung jarak haversine `agent location ↔ branch coordinate`
+3. Jika jarak > `GeoFenceRadiusMeters` (default 200m) → `400 OutsideGeoFence`
+4. Jika `GpsAccuracyMeters > 100m` → `400 LowGpsAccuracy`
+5. Upload selfie ke blob storage → dapat URL
+6. Tentukan status: `OnTime` jika `ClockInAt <= ShiftStart + 5m`, sebaliknya `Late`
+7. Persist `Attendance`, return DTO
+
+**Response**:
+```csharp
+public record ClockInResponse(
+    Guid AttendanceId,
+    DateTimeOffset ClockInAt,
+    string BranchName,
+    string Status,             // "OnTime" | "Late"
+    string SelfiePhotoUrl);
+```
+
+#### `POST /api/v1/attendance/clock-out`
+Mirror clock-in; validasi: harus sudah clock-in, belum clock-out. Jika `ClockOutAt > ShiftEnd + 30m` → tampilkan warning (non-blocking).
+
+#### `GET /api/v1/attendance/today`
+```csharp
+public record TodayAttendanceDto(
+    bool HasClockIn,
+    bool HasClockOut,
+    DateTimeOffset? ClockInAt,
+    DateTimeOffset? ClockOutAt,
+    TimeSpan? DurationRunning,
+    string ShiftLabel,           // "Reguler · 08:00–17:00 WIB"
+    string Status);
+```
+
+#### `GET /api/v1/attendance/history`
+**Query**: `?from=2026-08-01&to=2026-09-30&page=1&pageSize=20`
+**Response**: `PagedResult<AttendanceHistoryItemDto>` dengan field `Date`, `ClockIn`, `ClockOut`, `Duration`, `Status`, `StatusClass`.
+
+### 5.3 Prospects (Prospek Toko)
+
+| Method | Endpoint | Deskripsi | Auth |
+|---|---|---|---|
+| `GET` | `/api/v1/prospects?date={date}&page={n}&search={q}` | List prospek (filter & search) | Agent (own) / Supervisor (all) |
+| `GET` | `/api/v1/prospects/today` | List prospek hari ini + count | Agent |
+| `GET` | `/api/v1/prospects/{id}` | Detail prospek | OwnerOrSupervisor |
+| `POST` | `/api/v1/prospects` | Buat prospek baru | Agent |
+| `PUT` | `/api/v1/prospects/{id}` | Update prospek (jika status = New) | Owner |
+| `DELETE` | `/api/v1/prospects/{id}` | Hapus prospek (soft delete, jika New) | Owner |
+| `GET` | `/api/v1/prospects/{id}/photos/{kind}` | Stream foto (`plang`/`selfie`) | OwnerOrSupervisor |
+| `GET` | `/api/v1/prospects/{id}/photos/{kind}/download` | Force-download foto | OwnerOrSupervisor |
+
+#### `POST /api/v1/prospects` (`multipart/form-data`)
+**Request DTO**:
+```csharp
+public class CreateProspectRequest
+{
+    [Required, MaxLength(150)] public string StoreName { get; set; }
+    [Required, MaxLength(500)] public string Address { get; set; }
+    [Required, MaxLength(100)] public string PicName { get; set; }
+    [Required, Phone] public string PicPhone { get; set; }
+    [MaxLength(1000)] public string Notes { get; set; }
+    [Required] public double Latitude { get; set; }
+    [Required] public double Longitude { get; set; }
+    public double? GpsAccuracyMeters { get; set; }
+    [Required] public IFormFile PlangPhoto { get; set; }
+    [Required] public IFormFile SelfiePhoto { get; set; }
+}
+```
+**Business Rules (`ProspectService.CreateAsync`)**:
+1. **Prerequisite check**: agent harus sudah `ClockIn` hari ini (cek `Attendance.Today`). Jika belum → `409 AttendanceRequired` (sesuai mockup: "Absen wajib dilakukan sebelum memulai kunjungan prospek.")
+2. **Validation**: FluentValidation — phone minimal 9 digit, file size ≤5MB, MIME `image/jpeg`|`image/png`
+3. **Upload**: kedua foto ke blob dengan path `prospects/{agentId}/{yyyy-MM-dd}/{guid}_{kind}.jpg`. Generate SAS URL read-only.
+4. **Persist**: simpan record dengan `VisitedAt = UtcNow`, `Status = New`, `AgentId` dari claim
+5. **Notification**: enqueue `ProspectSaved` notification + push (jika terdaftar)
+6. **Return** `201 Created` dengan lokasi detail
+
+**Response**:
+```csharp
+public record ProspectDto(
+    Guid Id,
+    string StoreName,
+    string Address,
+    string PicName,
+    string PicPhone,
+    string Notes,
+    double Latitude,
+    double Longitude,
+    DateTimeOffset VisitedAt,
+    string PlangPhotoUrl,
+    string SelfiePhotoUrl,
+    string Status,
+    string AgentName);
+```
+
+#### `GET /api/v1/prospects?search=...&date=...`
+**Search fields**: `StoreName`, `Address`, `PicName` (case-insensitive contains)
+**Filter**: by date (`VisitedAt` WIB), optional
+**Pagination**: `page=1&pageSize=20`, max 100
+**Response**: `PagedResult<ProspectListItemDto>` dengan thumbnail URLs.
+
+#### `GET /api/v1/prospects/{id}/photos/{kind}`
+`kind` ∈ {`plang`, `selfie`}. Return `FileStreamResult` dengan `Content-Type: image/jpeg`. Validasi ownership sebelum stream.
+
+#### `GET /api/v1/prospects/{id}/photos/{kind}/download`
+Set `Content-Disposition: attachment; filename="Prospek_{StoreName}_{kind}.jpg"`. Stream blob.
+
+### 5.4 Notifications
+
+| Method | Endpoint | Deskripsi | Auth |
+|---|---|---|---|
+| `GET` | `/api/v1/notifications?page={n}` | List notifikasi (paginated, group by date) | Agent |
+| `GET` | `/api/v1/notifications/unread-count` | Hitung belum dibaca | Agent |
+| `PUT` | `/api/v1/notifications/{id}/read` | Tandai satu dibaca | Agent |
+| `PUT` | `/api/v1/notifications/read-all` | Tandai semua dibaca | Agent |
+
+#### `GET /api/v1/notifications` Response
+```csharp
+public record NotificationDto(
+    Guid Id,
+    string Title,
+    string Body,
+    string Type,             // string dari enum
+    string IconColor,        // "green" | "orange" | "blue" | "red"
+    bool IsUnread,
+    DateTimeOffset CreatedAt,
+    string CreatedAtLabel);  // "12:05 WIB" / "Kemarin 09:15 WIB"
+public record NotificationGroupDto(string DateLabel, List<NotificationDto> Items);
+```
+**Logic**: Group by `CreatedAt` (WIB) → "Hari Ini", "Kemarin", atau tanggal lengkap.
+
+### 5.5 Master Data
+
+| Method | Endpoint | Deskripsi | Auth |
+|---|---|---|---|
+| `GET` | `/api/v1/branches/current` | Branch agent login (untuk gate screen) | Agent |
+| `GET` | `/api/v1/branches/{id}` | Detail branch | Any authenticated |
+
+### 5.6 Health & Misc
+
+| Method | Endpoint | Deskripsi |
+|---|---|---|
+| `GET` | `/health` | Liveness probe |
+| `GET` | `/health/ready` | Readiness (DB + Blob + Redis) |
+| `GET` | `/api/v1/version` | `{ "version": "1.0.0", "build": "2026.09.04" }` |
+
+---
+
+## 6. Controllers
+
+### 6.1 Struktur
+```csharp
+[ApiController]
+[Route("api/v1/[controller]")]
+[Authorize]
+public class ProspectsController : ControllerBase
+{
+    private readonly IProspectService _service;
+    private readonly ILogger<ProspectsController> _logger;
+
+    [HttpGet]
+    public async Task<ActionResult<PagedResult<ProspectListItemDto>>> Get(
+        [FromQuery] ProspectQuery query, CancellationToken ct) { ... }
+
+    [HttpGet("today")]
+    public async Task<ActionResult<TodayProspectsDto>> GetToday(CancellationToken ct) { ... }
+
+    [HttpGet("{id:guid}")]
+    public async Task<ActionResult<ProspectDto>> GetById(Guid id, CancellationToken ct) { ... }
+
+    [HttpPost]
+    [Consumes("multipart/form-data")]
+    [RequestSizeLimit(20_000_000)]  // 20MB total
+    public async Task<ActionResult<ProspectDto>> Create(
+        [FromForm] CreateProspectRequest req, CancellationToken ct) { ... }
+
+    [HttpGet("{id:guid}/photos/{kind}")]
+    public async Task<IActionResult> GetPhoto(Guid id, string kind, CancellationToken ct) { ... }
+
+    [HttpGet("{id:guid}/photos/{kind}/download")]
+    public async Task<IActionResult> DownloadPhoto(Guid id, string kind, CancellationToken ct) { ... }
+}
+```
+
+### 6.2 Daftar Controllers
+1. `AuthController` — login, refresh, logout, forgot-password
+2. `AgentsController` — `/me`, stats, monthly chart, referral
+3. `AttendanceController` — today, clock-in/out, history
+4. `ProspectsController` — CRUD + photos
+5. `NotificationsController` — list, read, read-all, unread-count
+6. `BranchesController` — current, by-id
+7. `HealthController` — health/ready/version
+
+---
+
+## 7. Services (Application Layer)
+
+### 7.1 Interfaces
+```csharp
+public interface IAuthService
+{
+    Task<LoginResponse> LoginAsync(LoginRequest req, string ip, CancellationToken ct);
+    Task<RefreshResponse> RefreshAsync(RefreshRequest req, string ip, CancellationToken ct);
+    Task LogoutAsync(Guid agentId, CancellationToken ct);
+}
+
+public interface IAttendanceService
+{
+    Task<TodayAttendanceDto> GetTodayAsync(Guid agentId, CancellationToken ct);
+    Task<ClockInResponse> ClockInAsync(Guid agentId, ClockInRequest req, CancellationToken ct);
+    Task<ClockOutResponse> ClockOutAsync(Guid agentId, CancellationToken ct);
+    Task<PagedResult<AttendanceHistoryItemDto>> GetHistoryAsync(
+        Guid agentId, DateOnly from, DateOnly to, int page, int pageSize, CancellationToken ct);
+}
+
+public interface IProspectService
+{
+    Task<PagedResult<ProspectListItemDto>> SearchAsync(
+        Guid agentId, ProspectQuery query, CancellationToken ct);
+    Task<TodayProspectsDto> GetTodayAsync(Guid agentId, CancellationToken ct);
+    Task<ProspectDto> GetByIdAsync(Guid id, Guid requesterId, string role, CancellationToken ct);
+    Task<ProspectDto> CreateAsync(Guid agentId, CreateProspectRequest req, CancellationToken ct);
+    Task<ProspectDto> UpdateAsync(Guid id, Guid agentId, UpdateProspectRequest req, CancellationToken ct);
+    Task DeleteAsync(Guid id, Guid agentId, CancellationToken ct);
+}
+
+public interface INotificationService
+{
+    Task<PagedResult<NotificationGroupDto>> GetAsync(Guid agentId, int page, int pageSize, CancellationToken ct);
+    Task<int> GetUnreadCountAsync(Guid agentId, CancellationToken ct);
+    Task MarkAsReadAsync(Guid id, Guid agentId, CancellationToken ct);
+    Task MarkAllAsReadAsync(Guid agentId, CancellationToken ct);
+    Task EnqueueAsync(Guid agentId, NotificationType type, string title, string body, string payloadJson = null);
+}
+
+public interface IFileStorageService
+{
+    Task<string> UploadAsync(Stream stream, string blobName, string contentType, CancellationToken ct);
+    Task<Stream> DownloadAsync(string blobName, CancellationToken ct);
+    Task<string> GetSignedReadUrlAsync(string blobName, TimeSpan ttl);
+    Task DeleteAsync(string blobName, CancellationToken ct);
+}
+
+public interface IGeoService
+{
+    double HaversineMeters(double lat1, double lng1, double lat2, double lng2);
+    bool IsWithinRadius(double lat1, double lng1, double lat2, double lng2, double radiusMeters);
+}
+
+public interface IAgentStatsService
+{
+    Task<MonthlyProspectChartResponse> GetMonthlyAsync(Guid agentId, int year, CancellationToken ct);
+    Task<AgentStatsDto> GetCurrentMonthStatsAsync(Guid agentId, CancellationToken ct);
+}
+```
+
+### 7.2 Business Logic Highlights
+
+#### `AttendanceService.ClockInAsync`
+1. Load `agent` with `Branch`
+2. `attendance = await repo.GetTodayAsync(agentId)` → if exists & `ClockInAt != null` → throw `ConflictException("AlreadyClockedIn")`
+3. `distance = _geo.HaversineMeters(req.Latitude, req.Longitude, branch.Latitude, branch.Longitude)`
+4. if `distance > branch.GeoFenceRadiusMeters` → throw `DomainException("OutsideGeoFence", Details: { distance, allowed })`
+5. if `req.GpsAccuracyMeters > 100` → throw `DomainException("LowGpsAccuracy")`
+6. `selfieUrl = await _file.UploadAsync(req.SelfiePhoto.OpenReadStream(), $"attendance/{agentId}/{date}/{guid}.jpg", "image/jpeg")`
+7. `attendance.ClockInAt = DateTimeOffset.UtcNow`
+8. `attendance.Status = (localTime > shiftStart.AddMinutes(5)) ? Late : OnTime`
+9. `await repo.SaveChangesAsync(ct)`
+10. `await _notification.EnqueueAsync(agentId, NotificationType.ClockIn, "Clock in tercatat", ...)`
+11. Return mapped DTO
+
+#### `ProspectService.CreateAsync`
+1. `attendance = await _attendance.GetTodayAsync(agentId)` → if null or `ClockInAt == null` → throw `ConflictException("AttendanceRequired")`
+2. Validate via `CreateProspectValidator`
+3. Generate blob names: `prospects/{agentId}/{yyyyMMdd}/{guid}_plang.jpg` and `..._selfie.jpg`
+4. Upload both in parallel (`Task.WhenAll`)
+5. Persist `Prospect` entity
+6. `await _notification.EnqueueAsync(agentId, ProspectSaved, "Prospek tersimpan", $"Data {req.StoreName} berhasil masuk ke sistem.")`
+7. Return `ProspectDto`
+
+#### `AgentStatsService.GetMonthlyAsync`
+```csharp
+var data = await _repo.Prospects
+    .Where(p => p.AgentId == agentId && p.VisitedAt.Year == year)
+    .GroupBy(p => p.VisitedAt.Month)
+    .Select(g => new { Month = g.Key, Count = g.Count() })
+    .ToListAsync(ct);
+
+// Map to month names (Jan-Sep ...), fill 0 for missing months, mark current
+```
+
+---
+
+## 8. DTOs (Lengkap)
+
+### 8.1 Auth
+```csharp
+public record LoginRequest(string Username, string Password, bool RememberMe);
+public record LoginResponse(Guid AgentId, string AccessToken, string RefreshToken,
+                            DateTimeOffset ExpiresAt, string ReferralCode, string FullName);
+public record RefreshRequest(string AccessToken, string RefreshToken);
+public record RefreshResponse(string AccessToken, string RefreshToken, DateTimeOffset ExpiresAt);
+```
+
+### 8.2 Attendance
+```csharp
+public record ClockInRequest(double Latitude, double Longitude, IFormFile SelfiePhoto, double? GpsAccuracyMeters);
+public record ClockOutRequest(double Latitude, double Longitude, IFormFile? SelfiePhoto, double? GpsAccuracyMeters);
+public record ClockInResponse(Guid AttendanceId, DateTimeOffset ClockInAt, string BranchName,
+                              string Status, string SelfiePhotoUrl);
+public record TodayAttendanceDto(bool HasClockIn, bool HasClockOut,
+                                  DateTimeOffset? ClockInAt, DateTimeOffset? ClockOutAt,
+                                  TimeSpan? DurationRunning, string ShiftLabel, string Status);
+public record AttendanceHistoryItemDto(DateOnly Date, string DayName, string ClockIn,
+                                       string ClockOut, string Duration, string Status, string StatusClass);
+```
+
+### 8.3 Prospect
+```csharp
+public record CreateProspectRequest(string StoreName, string Address, string PicName,
+                                     string PicPhone, string Notes, double Latitude,
+                                     double Longitude, double? GpsAccuracyMeters,
+                                     IFormFile PlangPhoto, IFormFile SelfiePhoto);
+public record ProspectListItemDto(Guid Id, string StoreName, string Address, string PicName,
+                                  string VisitedAtLabel, string ThumbnailUrl, string Status,
+                                  string StatusClass);
+public record ProspectDto(Guid Id, string StoreName, string Address, string PicName,
+                          string PicPhone, string Notes, double Latitude, double Longitude,
+                          DateTimeOffset VisitedAt, string PlangPhotoUrl, string SelfiePhotoUrl,
+                          string Status, string AgentName);
+public record TodayProspectsDto(int Count, List<ProspectListItemDto> Items);
+```
+
+### 8.4 Notifications & Stats
+```csharp
+public record NotificationDto(Guid Id, string Title, string Body, string Type,
+                              string IconColor, bool IsUnread, DateTimeOffset CreatedAt, string CreatedAtLabel);
+public record NotificationGroupDto(string DateLabel, List<NotificationDto> Items);
+public record MonthlyProspectDto(string Month, int Count, bool IsCurrentMonth);
+public record MonthlyProspectChartResponse(int Year, int Total, List<MonthlyProspectDto> Months);
+public record AgentStatsDto(int ProspectsThisMonth, double AttendanceRate, double GrowthPercent);
+```
+
+### 8.5 Generic
+```csharp
+public record PagedResult<T>(List<T> Items, int Page, int PageSize, int TotalCount, int TotalPages);
+public record ErrorResponse(string Type, string Title, int Status, string Detail, string Instance, Dictionary<string,object> Errors);
+```
+
+---
+
+## 9. Validation (FluentValidation)
+
+### 9.1 `CreateProspectValidator`
+```csharp
+public class CreateProspectValidator : AbstractValidator<CreateProspectRequest>
+{
+    public CreateProspectValidator()
+    {
+        RuleFor(x => x.StoreName).NotEmpty().MaximumLength(150);
+        RuleFor(x => x.Address).NotEmpty().MaximumLength(500);
+        RuleFor(x => x.PicName).NotEmpty().MaximumLength(100);
+        RuleFor(x => x.PicPhone).NotEmpty().Matches(@"^(\+62|62|0)8[1-9]\d{6,11}$")
+            .WithMessage("Nomor telepon PIC tidak valid.");
+        RuleFor(x => x.Notes).MaximumLength(1000);
+        RuleFor(x => x.Latitude).InclusiveBetween(-90, 90);
+        RuleFor(x => x.Longitude).InclusiveBetween(-180, 180);
+        RuleFor(x => x.PlangPhoto).NotNull()
+            .Must(f => f.Length <= 5_000_000).WithMessage("Ukuran foto plang maksimal 5MB.")
+            .Must(f => f.ContentType is "image/jpeg" or "image/png");
+        RuleFor(x => x.SelfiePhoto).NotNull()
+            .Must(f => f.Length <= 5_000_000).WithMessage("Ukuran foto selfie maksimal 5MB.")
+            .Must(f => f.ContentType is "image/jpeg" or "image/png");
+    }
+}
+```
+
+### 9.2 `ClockInValidator`
+```csharp
+public class ClockInValidator : AbstractValidator<ClockInRequest>
+{
+    public ClockInValidator()
+    {
+        RuleFor(x => x.Latitude).InclusiveBetween(-90, 90);
+        RuleFor(x => x.Longitude).InclusiveBetween(-180, 180);
+        RuleFor(x => x.SelfiePhoto).NotNull().Must(f => f.Length <= 5_000_000);
+        RuleFor(x => x.GpsAccuracyMeters).LessThanOrEqualTo(100).When(x => x.GpsAccuracyMeters.HasValue);
+    }
 }
 ```
 
 ---
 
-## 6. API Response Standards
+## 10. Middleware & Error Handling
 
-### 6.1 Success Response
+### 10.1 Pipeline Order (`Program.cs`)
+```csharp
+app.UseExceptionHandler(errApp => errApp.UseExceptionHandlerMiddleware());
+app.UseHttpsRedirection();
+app.UseSerilogRequestLogging();
+app.UseRateLimiter();
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers();
+```
+
+### 10.2 Exception → HTTP Mapping
+| Exception | HTTP | Code |
+|---|---|---|
+| `NotFoundException` | 404 | `NotFound` |
+| `ConflictException` | 409 | `Conflict` |
+| `DomainException` | 400 | custom code |
+| `ValidationException` | 422 | `ValidationFailed` |
+| `UnauthorizedException` | 401 | `Unauthorized` |
+| `ForbiddenException` | 403 | `Forbidden` |
+| `RateLimitExceededException` | 429 | `RateLimited` |
+| Unhandled | 500 | `InternalError` |
+
+### 10.3 Sample Error Body
 ```json
 {
-  "success": true,
-  "data": { ... },
-  "message": null
+  "type": "https://salespoint.visionet.co.id/errors/attendance-required",
+  "title": "Attendance required",
+  "status": 409,
+  "detail": "Absen wajib dilakukan sebelum memulai kunjungan prospek.",
+  "instance": "/api/v1/prospects",
+  "code": "AttendanceRequired",
+  "errors": {}
 }
 ```
 
-### 6.2 Error Response
-```json
-{
-  "success": false,
-  "data": null,
-  "error": {
-    "code": "ERR_GEOFENCE_VIOLATION",
-    "message": "You are 1200m from your branch. Max allowed: 500m."
-  }
-}
-```
-
-### 6.3 Error Codes
-
-| Code | HTTP | Description |
-|---|---|---|
-| `ERR_INVALID_CREDENTIALS` | 401 | Wrong username/password |
-| `ERR_ACCOUNT_LOCKED` | 423 | Too many failed attempts |
-| `ERR_TOKEN_EXPIRED` | 401 | Access token expired |
-| `ERR_TOKEN_INVALID` | 401 | Malformed/revoked token |
-| `ERR_NOT_CLOCKED_IN` | 403 | Prospect creation without clock-in |
-| `ERR_GEOFENCE_VIOLATION` | 400 | Agent too far from branch |
-| `ERR_ALREADY_CLOCKED_IN` | 409 | Duplicate clock-in |
-| `ERR_ALREADY_CLOCKED_OUT` | 409 | Duplicate clock-out |
-| `ERR_NOT_CLOCKED_OUT` | 400 | Clock-out without clock-in |
-| `ERR_PHOTO_MISSING` | 400 | Required photos not provided |
-| `ERR_PHOTO_TOO_LARGE` | 413 | File exceeds 10MB |
-| `ERR_VALIDATION` | 422 | Model validation failed |
-| `ERR_NOT_FOUND` | 404 | Resource not found |
-
 ---
 
-## 7. Cross-Cutting Concerns
+## 11. Security
 
-### 7.1 Middleware Pipeline (order matters)
-1. ExceptionHandlerMiddleware (global try-catch → standardized error JSON)
-2. SerilogRequestLogging
-3. RateLimitingMiddleware (per-IP + per-user)
-4. JwtAuthenticationMiddleware
-5. AuthorizationMiddleware
-6. Swagger (Dev only)
-7. EndpointRouting
-8. Controllers
+### 11.1 Transport & Headers
+- Force HTTPS; redirect HTTP
+- HSTS di production
+- Security headers via `NetEscapades.AspNetCore.SecurityHeaders`: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Content-Security-Policy: default-src 'none'`
 
-### 7.2 Rate Limiting
-
-| Endpoint Group | Limit | Window |
-|---|---|---|
-| `/api/auth/login` | 5 | 5 minutes per IP+username |
-| All authenticated endpoints | 100 | 1 minute per agent |
-| Photo upload | 20 | 1 minute per agent |
-
-### 7.3 Validation
-- All DTOs validated via **FluentValidation**.
-- `CreateProspectRequestDto`:
-  - `StoreName`: not empty, max 200
-  - `Address`: not empty, max 500
-  - `PicName`: not empty, max 100
-  - `PicPhone`: numeric, 9–15 digits
-  - `PhotoPlangId`, `PhotoSelfieId`: required, must exist
-
-### 7.4 Timezone
-- All timestamps stored in **UTC**.
-- API accepts/returns **WIB (UTC+7)** formatted strings for display: `HH:mm WIB`, `dd MMMM yyyy`.
-- Helper: `DateTimeExtensions.ToWIB()`.
-
-### 7.5 Pagination
-- Query params: `?page=1&size=10`
-- Response includes: `Items`, `TotalCount`, `Page`, `PageSize`
-- Max page size: 50.
-
----
-
-## 8. Non-Functional Requirements
-
-| Requirement | Target |
+### 11.2 Rate Limiting
+| Endpoint | Limit |
 |---|---|
-| Response time (p95) | < 300ms for list endpoints, < 150ms for single resource |
-| Photo upload (10MB) | < 5 seconds |
-| Availability | 99.9% during business hours (06:00–20:00 WIB) |
-| Database connection pooling | Min 5, Max 50 |
-| Concurrent agents | 500 active sessions |
-| Photo storage retention | 2 years |
-| Audit log | All clock-in/out, prospect create/delete, login events |
+| `POST /auth/login` | 10 / menit / IP |
+| `POST /auth/refresh` | 30 / menit / IP |
+| `POST /prospects` | 60 / jam / agent |
+| `POST /attendance/clock-in` | 10 / hari / agent |
+| Other read endpoints | 300 / menit / agent |
 
----
+### 11.3 File Upload Security
+- Validate MIME via content sniffing (`MimeDetective`), bukan hanya `ContentType` header
+- Max file size 5MB per foto, 20MB total per request
+- Strip EXIF untuk photo plang (privacy), retain untuk selfie (timestamp + GPS untuk audit)
+- Generate SAS URL read-only (TTL 1 jam) — tidak ekspos blob storage langsung
 
-## 9. Configuration (`appsettings.json`)
-
-```json
-{
-  "Jwt": {
-    "Issuer": "SalesPoint.API",
-    "Audience": "SalesPoint.App",
-    "AccessTokenMinutes": 480,
-    "RefreshTokenDays": 7,
-    "Secret": "{from-secrets}"
-  },
-  "Geofence": {
-    "MaxDistanceMeters": 500,
-    "ShiftStart": "08:00",
-    "ShiftEnd": "17:00",
-    "ClockOutReminderHour": 16
-  },
-  "PhotoStorage": {
-    "Provider": "Blob",
-    "MaxFileSizeMB": 10,
-    "AllowedTypes": ["image/jpeg", "image/png", "image/webp"],
-    "ThumbnailWidth": 320
-  },
-  "RateLimit": {
-    "LoginMaxAttempts": 5,
-    "LoginWindowMinutes": 5,
-    "LockDurationMinutes": 15,
-    "ApiPerMinute": 100,
-    "UploadPerMinute": 20
-  },
-  "ConnectionStrings": {
-    "DefaultConnection": "{from-secrets}"
-  }
-}
-```
-
----
-
-## 10. Future Considerations (Out of Scope v1.0)
-- Push notifications (FCM/APNS) for real-time alerts
-- Offline sync (PWA service worker / mobile SDK)
-- Supervisor dashboard API (approve/reject prospects)
-- Bulk prospect export (Excel/CSV)
-- Agent leaderboard & gamification
-- Integration with external CRM (Salesforce/HubSpot)
-
----
-
-**End of Document**
+### 11.4 PII Handling
+- `PicPhone` disimpan sebagai E.164, di-mask (`0812 **** 7890`) di response publik/list
